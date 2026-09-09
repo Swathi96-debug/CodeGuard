@@ -55,7 +55,11 @@ export default function CompilerInterface({ initialCode, onBackToWelcome, theme,
     }
 
     try {
-      const response = await fetch('http://127.0.0.1:8001/analyze', {
+      const apiUrl = window.location.origin.includes('5173')
+        ? 'http://127.0.0.1:8000/analyze'
+        : '/analyze';
+
+      const response = await fetch(apiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ code })
