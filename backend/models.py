@@ -84,6 +84,14 @@ class TokenStats(BaseModel):
     strings: int = 0
     total: int = 0
 
+class FunctionComplexity(BaseModel):
+    name: str
+    line: int
+    cyclomatic_complexity: int
+    statement_count: int
+    max_nesting_depth: int
+    rating: str  # LOW, MODERATE, HIGH
+
 class ReportStats(BaseModel):
     lines_of_code: int
     tokens_count: int
@@ -94,6 +102,8 @@ class ReportStats(BaseModel):
     duplicate_blocks: int
     variables_count: int
     overall_status: str  # CLEAN, NEEDS ATTENTION, ERRORS FOUND
+    cyclomatic_complexity: Optional[int] = 1
+    complexity_rating: Optional[str] = "LOW"
 
 class PreprocessResult(BaseModel):
     original_code: str
@@ -112,3 +122,4 @@ class AnalyzeResponse(BaseModel):
     anomalies: List[Anomaly]
     suggestions: List[SuggestionItem]
     statistics: ReportStats
+    complexity: List[FunctionComplexity] = []

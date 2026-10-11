@@ -60,6 +60,8 @@ else:
     def read_root():
         return {"status": "online", "system": "CodeGuard Backend Server"}
 
+from complexity_analyzer import ComplexityAnalyzer
+
 @app.post("/analyze", response_model=AnalyzeResponse)
 def analyze_code(req: AnalyzeRequest):
     code = req.code
@@ -95,6 +97,10 @@ def analyze_code(req: AnalyzeRequest):
     dup_detector = DuplicationDetector(code, tokens)
     duplications = dup_detector.detect()
 
+    # 7b. Code Complexity Analysis
+    complexity_analyzer = ComplexityAnalyzer(ast, tokens)
+    complexity_metrics = complexity_analyzer.analyze()
+
     # 8. Suggestion Engine & Anomaly Center
     sugg_engine = SuggestionEngine(code, syntax_issues, semantic_issues, memory_analysis, duplications)
     anomalies, suggestions = sugg_engine.generate()
@@ -106,6 +112,14 @@ def analyze_code(req: AnalyzeRequest):
     mem_issues_count = len([m for m in memory_analysis if m.status not in ("SAFE", "ESCAPED")])
     dup_blocks_count = len(duplications)
     warn_count = len([a for a in anomalies if a.severity == "warning"])
+
+    peak_cc = max([c.cyclomatic_complexity for c in complexity_metrics], default=1)
+    if peak_cc <= 5:
+        cc_rating = "LOW"
+    elif peak_cc <= 10:
+        cc_rating = "MODERATE"
+    else:
+        cc_rating = "HIGH"
 
     if syntax_errs_count > 0 or sem_errs_count > 0:
         overall_status = "ERRORS FOUND"
@@ -123,7 +137,9 @@ def analyze_code(req: AnalyzeRequest):
         memory_issues=mem_issues_count,
         duplicate_blocks=dup_blocks_count,
         variables_count=len(symbol_table),
-        overall_status=overall_status
+        overall_status=overall_status,
+        cyclomatic_complexity=peak_cc,
+        complexity_rating=cc_rating
     )
 
     return AnalyzeResponse(
@@ -138,7 +154,8 @@ def analyze_code(req: AnalyzeRequest):
         duplication=duplications,
         anomalies=anomalies,
         suggestions=suggestions,
-        statistics=report_stats
+        statistics=report_stats,
+        complexity=complexity_metrics
     )
 
 if __name__ == "__main__":

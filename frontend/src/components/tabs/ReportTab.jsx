@@ -10,7 +10,7 @@ export default function ReportTab({ analysisResult, onAnalyze, onClear }) {
     );
   }
 
-  const { statistics, tokens, syntax_issues, symbol_table, semantic_issues, memory_analysis, duplication, suggestions } = analysisResult;
+  const { statistics, tokens, syntax_issues, symbol_table, semantic_issues, memory_analysis, duplication, suggestions, complexity } = analysisResult;
 
   const handleDownloadTxt = () => {
     const textContent = `=====================================================
@@ -24,6 +24,7 @@ Semantic Errors: ${statistics.semantic_errors}
 Memory Issues: ${statistics.memory_issues}
 Duplicate Blocks: ${statistics.duplicate_blocks}
 Symbol Table Count: ${statistics.variables_count}
+Peak Cyclomatic Complexity: ${statistics.cyclomatic_complexity || 1} (${statistics.complexity_rating || 'LOW'})
 
 -----------------------------------------------------
 1. TOKENS SUMMARY
@@ -49,6 +50,11 @@ ${memory_analysis?.length === 0 ? "No heap allocations found." : memory_analysis
 5. DUPLICATION ANALYSIS
 -----------------------------------------------------
 ${duplication?.length === 0 ? "No duplication found." : duplication.map(d => `Lines ${d.block_a_lines[0]} & ${d.block_b_lines[0]} -> ${d.similarity_percentage}% similarity`).join('\n')}
+
+-----------------------------------------------------
+6. COMPLEXITY METRICS
+-----------------------------------------------------
+${complexity?.length ? complexity.map(c => `Function '${c.name}' (Line ${c.line}): Cyclomatic Complexity = ${c.cyclomatic_complexity} (${c.rating}), Statements = ${c.statement_count}, Max Nesting = ${c.max_nesting_depth}`).join('\n') : "No functions analyzed."}
 `;
 
     const blob = new Blob([textContent], { type: 'text/plain;charset=utf-8' });
@@ -74,7 +80,8 @@ ${duplication?.length === 0 ? "No duplication found." : duplication.map(d => `Li
 Status: ${statistics.overall_status}
 LOC: ${statistics.lines_of_code} | Tokens: ${statistics.tokens_count}
 Errors: Syntax (${statistics.syntax_errors}), Semantic (${statistics.semantic_errors}), Memory (${statistics.memory_issues})
-Duplicate Blocks: ${statistics.duplicate_blocks}`;
+Duplicate Blocks: ${statistics.duplicate_blocks}
+Peak Complexity: CC ${statistics.cyclomatic_complexity || 1} (${statistics.complexity_rating || 'LOW'})`;
     navigator.clipboard.writeText(summary);
     alert('Analysis summary copied to clipboard!');
   };
@@ -118,6 +125,10 @@ Duplicate Blocks: ${statistics.duplicate_blocks}`;
           <div className="stat-box-num">{statistics.duplicate_blocks}</div>
           <div className="stat-box-label">Duplicate Blocks</div>
         </div>
+        <div className="stat-box">
+          <div className="stat-box-num">{statistics.cyclomatic_complexity || 1}</div>
+          <div className="stat-box-label">Cyclomatic CC ({statistics.complexity_rating || 'LOW'})</div>
+        </div>
       </div>
 
       <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', margin: '20px 0' }}>
@@ -143,6 +154,28 @@ Duplicate Blocks: ${statistics.duplicate_blocks}`;
         </button>
       </div>
 
+      {complexity && complexity.length > 0 && (
+        <div className="card-item" style={{ marginBottom: '16px' }}>
+          <h4 style={{ fontSize: '13px', fontWeight: 600, marginBottom: '10px' }}>Function Complexity Breakdown</h4>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            {complexity.map((c, idx) => (
+              <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', background: 'var(--bg-secondary)', borderRadius: '6px' }}>
+                <div>
+                  <strong style={{ fontSize: '13px' }}>{c.name}()</strong>
+                  <span style={{ fontSize: '11px', color: 'var(--text-muted)', marginLeft: '6px' }}>Line {c.line}</span>
+                </div>
+                <div style={{ display: 'flex', gap: '14px', alignItems: 'center', fontSize: '12px' }}>
+                  <span>Cyclomatic Complexity: <strong>{c.cyclomatic_complexity}</strong></span>
+                  <span>Statements: <strong>{c.statement_count}</strong></span>
+                  <span>Max Nesting: <strong>{c.max_nesting_depth}</strong></span>
+                  <span className={`badge badge-${c.rating === 'LOW' ? 'safe' : c.rating === 'MODERATE' ? 'warning' : 'error'}`}>{c.rating} RISK</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="card-item">
         <h4 style={{ fontSize: '13px', fontWeight: 600, marginBottom: '8px' }}>Pipeline Audit Checklist</h4>
         <ul style={{ fontSize: '12px', color: 'var(--text-secondary)', paddingLeft: '20px', lineHeight: '1.8' }}>
@@ -152,6 +185,7 @@ Duplicate Blocks: ${statistics.duplicate_blocks}`;
           <li>Symbol Table: Registered {symbol_table?.length || 0} variable declarations.</li>
           <li>Memory Analyzer: Inspected heap memory lifecycle ({memory_analysis?.length || 0} pointers tracked).</li>
           <li>Duplication Engine: Scanned normalized token similarity.</li>
+          <li>Complexity Metrics: Calculated cyclomatic complexity and nesting depth.</li>
         </ul>
       </div>
     </div>

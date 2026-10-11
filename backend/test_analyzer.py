@@ -3479,6 +3479,402 @@ int main() {
         self.assertEqual(invs[0].severity, "error")
 
 
+class TestPhase3EDuplicationAndComplexity(unittest.TestCase):
+    """Phase 3E: Duplicate-Code Detection, Complexity Metrics & Full Integration."""
+
+    def test_exact_duplicate_blocks(self):
+        """Phase 3E: Detect exact repeated code blocks with 100% similarity."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int main() {
+    int a = 10;
+    int b = 20;
+    int sum1 = a + b;
+
+    int dummy = 0;
+
+    int a = 10;
+    int b = 20;
+    int sum1 = a + b;
+
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.duplication), 1)
+        dup = res.duplication[0]
+        self.assertEqual(dup.similarity_percentage, 100.0)
+        self.assertIn("Exact code block duplication", dup.reason)
+        self.assertEqual(dup.block_a_lines, [2, 4])
+        self.assertEqual(dup.block_b_lines, [8, 10])
+
+    def test_structural_clone_renamed_identifiers(self):
+        """Phase 3E: Detect repeated statement sequence with renamed identifiers."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int main() {
+    int first_val = 15;
+    int second_val = 25;
+    int total_sum = first_val + second_val;
+
+    int item_x = 40;
+    int item_y = 60;
+    int total_calc = item_x + item_y;
+
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertGreaterEqual(len(res.duplication), 1)
+        dup = res.duplication[0]
+        self.assertGreater(dup.similarity_percentage, 80.0)
+        self.assertLess(dup.similarity_percentage, 100.0)
+        self.assertIn("Structural clone", dup.reason)
+
+    def test_structural_clone_minor_literals(self):
+        """Phase 3E: Detect repeated blocks with minor literal differences."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int main() {
+    int x = 100;
+    int y = 200;
+    int res1 = x * 2 + y;
+
+    int a = 300;
+    int b = 400;
+    int res2 = a * 2 + b;
+
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.duplication), 1)
+        dup = res.duplication[0]
+        self.assertGreaterEqual(dup.similarity_percentage, 80.0)
+
+    def test_cross_function_duplicate_blocks(self):
+        """Phase 3E: Detect duplicated blocks across different functions."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """void compute_alpha(int mode) {
+    int step1 = 10;
+    int step2 = 20;
+    int result = step1 + step2;
+}
+
+void compute_beta(char *flag) {
+    int step1 = 10;
+    int step2 = 20;
+    int result = step1 + step2;
+}
+
+int main() {
+    compute_alpha(1);
+    compute_beta("ok");
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.duplication), 1)
+        dup = res.duplication[0]
+        self.assertEqual(dup.similarity_percentage, 100.0)
+        self.assertEqual(dup.block_a_lines, [2, 4])
+        self.assertEqual(dup.block_b_lines, [8, 10])
+
+    def test_cross_function_clone_with_renamed_signature(self):
+        """Phase 3E: Full function clone with renamed function name is recognized as structural clone."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """void compute_alpha(void) {
+    int step1 = 10;
+    int step2 = 20;
+    int result = step1 + step2;
+}
+
+void compute_beta(void) {
+    int step1 = 10;
+    int step2 = 20;
+    int result = step1 + step2;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.duplication), 1)
+        dup = res.duplication[0]
+        self.assertGreater(dup.similarity_percentage, 95.0)
+        self.assertLess(dup.similarity_percentage, 100.0)
+        self.assertEqual(dup.block_a_lines, [1, 4])
+        self.assertEqual(dup.block_b_lines, [7, 10])
+
+    def test_overlapping_matches_suppressed(self):
+        """Phase 3E: Overlapping sub-windows of already matched block are not reported."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int main() {
+    int v1 = 1;
+    int v2 = 2;
+    int v3 = 3;
+    int v4 = v1 + v2;
+    int v5 = v3 + v4;
+
+    int sep = 0;
+
+    int v1 = 1;
+    int v2 = 2;
+    int v3 = 3;
+    int v4 = v1 + v2;
+    int v5 = v3 + v4;
+
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        # Should report exactly 1 maximal duplicate block, not multiple sub-windows
+        self.assertEqual(len(res.duplication), 1)
+        dup = res.duplication[0]
+        self.assertEqual(dup.block_a_lines, [2, 6])
+        self.assertEqual(dup.block_b_lines, [10, 14])
+
+    def test_short_common_statements_not_flagged(self):
+        """Phase 3E: Trivial declarations and boilerplate are not flagged as duplicates."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int main() {
+    int a;
+    int b;
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.duplication), 0)
+
+    def test_formatting_and_whitespace_invariance(self):
+        """Phase 3E: Formatting and indentation differences do not break duplicate detection."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int main() {
+    int   a = 10;
+    int   b = 20;
+    int sum = a + b;
+
+        int a = 10;
+        int b = 20;
+        int sum = a + b;
+
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.duplication), 1)
+        self.assertEqual(res.duplication[0].similarity_percentage, 100.0)
+
+    def test_complexity_simple_linear_function(self):
+        """Phase 3E: Linear function has McCabe cyclomatic complexity = 1."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int compute(int x) {
+    int y = x + 10;
+    int z = y * 2;
+    return z;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.complexity), 1)
+        c = res.complexity[0]
+        self.assertEqual(c.name, "compute")
+        self.assertEqual(c.cyclomatic_complexity, 1)
+        self.assertEqual(c.statement_count, 3)
+        self.assertEqual(c.max_nesting_depth, 1)
+        self.assertEqual(c.rating, "LOW")
+
+    def test_complexity_if_else_branches(self):
+        """Phase 3E: if/else branch increments cyclomatic complexity to 2."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int check(int x) {
+    if (x > 0) {
+        return 1;
+    } else {
+        return -1;
+    }
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.complexity), 1)
+        c = res.complexity[0]
+        self.assertEqual(c.cyclomatic_complexity, 2)
+        self.assertEqual(c.max_nesting_depth, 2)
+
+    def test_complexity_if_else_if(self):
+        """Phase 3E: if / else if / else chain increments cyclomatic complexity to 3."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int sign(int x) {
+    if (x > 0) {
+        return 1;
+    } else if (x < 0) {
+        return -1;
+    } else {
+        return 0;
+    }
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.complexity), 1)
+        c = res.complexity[0]
+        self.assertEqual(c.cyclomatic_complexity, 3)
+
+    def test_complexity_loops_and_nesting(self):
+        """Phase 3E: While and for loops increment CC; nested loop increases max nesting depth."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """void process_matrix(int n) {
+    int i = 0;
+    while (i < n) {
+        int j = 0;
+        while (j < n) {
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.complexity), 1)
+        c = res.complexity[0]
+        # Base 1 + 2 while loops = 3
+        self.assertEqual(c.cyclomatic_complexity, 3)
+        # Nested while inside while has nesting depth >= 3
+        self.assertGreaterEqual(c.max_nesting_depth, 3)
+
+    def test_complexity_logical_operators(self):
+        """Phase 3E: Logical operators (&&, ||) each add a decision point to CC."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int validate(int a, int b, int c) {
+    if (a > 0 && b > 0 || c > 0) {
+        return 1;
+    }
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.complexity), 1)
+        c = res.complexity[0]
+        # Base 1 + 1 (if) + 1 (&&) + 1 (||) = 4
+        self.assertEqual(c.cyclomatic_complexity, 4)
+
+    def test_complexity_multiple_functions_summary(self):
+        """Phase 3E: Multiple functions report distinct metrics and peak CC in statistics."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int simple_func(void) {
+    return 42;
+}
+
+int complex_func(int a, int b) {
+    if (a > 0) {
+        if (b > 0) {
+            return 1;
+        }
+    }
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.complexity), 2)
+        names = {c.name: c.cyclomatic_complexity for c in res.complexity}
+        self.assertEqual(names["simple_func"], 1)
+        self.assertEqual(names["complex_func"], 3)
+        self.assertEqual(res.statistics.cyclomatic_complexity, 3)
+        self.assertEqual(res.statistics.complexity_rating, "LOW")
+
+    def test_complexity_empty_and_global_conservatively(self):
+        """Phase 3E: Programs without function definitions or empty input handle gracefully."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int x = 10;
+int y = 20;"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertIsNotNone(res.complexity)
+        self.assertEqual(res.statistics.cyclomatic_complexity, 1)
+
+    def test_cross_feature_duplication_with_memory_leak(self):
+        """Phase 3E: Duplication detection alongside a definite memory leak preserves leak diagnostic."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int main() {
+    int *leak = malloc(64);
+
+    int a = 10;
+    int b = 20;
+    int sum1 = a + b;
+
+    int c = 10;
+    int d = 20;
+    int sum2 = c + d;
+
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        # Duplication detected
+        self.assertEqual(len(res.duplication), 1)
+        # Definite memory leak detected and preserved
+        leaks = [m for m in res.memory_analysis if m.status == "DEFINITE LEAK"]
+        self.assertEqual(len(leaks), 1)
+        self.assertEqual(leaks[0].pointer, "leak")
+        self.assertEqual(leaks[0].severity, "error")
+
+    def test_cross_feature_duplication_with_use_after_free(self):
+        """Phase 3E: Duplication alongside use-after-free preserves UAF diagnostic without suppression."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int main() {
+    int *p = malloc(16);
+    free(p);
+    *p = 100;
+
+    int v1 = 1;
+    int v2 = 2;
+    int res1 = v1 + v2;
+
+    int v1 = 1;
+    int v2 = 2;
+    int res1 = v1 + v2;
+
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.duplication), 1)
+        uaf = [a for a in res.anomalies if a.issue_type == "USE AFTER FREE"]
+        self.assertEqual(len(uaf), 1)
+        self.assertEqual(uaf[0].severity, "error")
+
+    def test_safe_fix_policy_preservation(self):
+        """Phase 3E: Duplication and complexity never generate automatic safe fixes."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int main() {
+    int a = 1;
+    int b = 2;
+    int c = a + b;
+
+    int a = 1;
+    int b = 2;
+    int c = a + b;
+
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        # Ensure no suggestions have safe fixes for duplicate code
+        for s in res.suggestions:
+            if "Duplication" in s.category or "Complexity" in s.category:
+                self.assertIsNone(s.safe_fix)
+
+
 if __name__ == "__main__":
     unittest.main()
 
