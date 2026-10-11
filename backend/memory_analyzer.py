@@ -1,7 +1,24 @@
 import re
+from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any, Set, Tuple
 from models import Token, MemoryAllocation, SymbolEntry
 from parser import Parser
+
+@dataclass
+class FunctionSummary:
+    """Interprocedural summary tracking memory semantics of a function definition."""
+    name: str
+    params: List[str]
+    returns_allocation: bool = False
+    alloc_function: str = "malloc"
+    escaped_alloc_id: Optional[str] = None
+    freed_param_indices: Set[int] = field(default_factory=set)
+    dereferenced_param_indices: Set[int] = field(default_factory=set)
+    returned_param_alias: Optional[int] = None
+    returned_param_is_interior: bool = False
+    transfers_ownership_params: Set[int] = field(default_factory=set)
+    is_recursive: bool = False
+    is_captured: bool = False
 
 class AllocationInstance:
     """Represents a unique heap memory allocation identity with provenance and path tracking."""
@@ -93,11 +110,192 @@ class MemoryAnalyzer:
             except Exception:
                 self.ast = {"type": "ProgramNode", "statements": []}
 
+    def _build_function_summaries(self):
+        """Constructs conservative summaries of all function declarations in the AST."""
+        self.function_summaries: Dict[str, FunctionSummary] = {}
+        if not self.ast or not isinstance(self.ast, dict):
+            return
+
+        fn_nodes: Dict[str, Dict[str, Any]] = {}
+        for stmt in self.ast.get("statements", []):
+            if isinstance(stmt, dict) and stmt.get("type") == "FunctionDeclarationNode":
+                name = stmt.get("name")
+                if name and stmt.get("body"):
+                    fn_nodes[name] = stmt
+                    params = stmt.get("params", [])
+                    self.function_summaries[name] = FunctionSummary(name=name, params=params)
+
+        if not fn_nodes:
+            return
+
+        # Fixed-point iteration (up to 5 passes) to propagate helper behavior and handle recursion
+        for _ in range(5):
+            changed = False
+            for name, node in fn_nodes.items():
+                summ = self.function_summaries[name]
+                param_map = {p: i for i, p in enumerate(summ.params)}
+                body = node.get("body", {})
+
+                local_allocs: Dict[str, str] = {}
+
+                def scan_node(n: Any):
+                    nonlocal changed
+                    if not isinstance(n, dict):
+                        return
+                    ntype = n.get("type")
+
+                    if ntype == "DeclarationNode":
+                        vname = n.get("name")
+                        init_expr = n.get("initializer")
+                        if init_expr:
+                            alloc_info = self._extract_alloc_call(init_expr)
+                            if alloc_info:
+                                local_allocs[vname] = alloc_info[0]
+                            elif isinstance(init_expr, dict) and init_expr.get("type") == "FunctionCallNode":
+                                cname = init_expr.get("name")
+                                if cname in self.function_summaries and self.function_summaries[cname].returns_allocation:
+                                    local_allocs[vname] = self.function_summaries[cname].alloc_function
+
+                    elif ntype == "AssignmentNode":
+                        target = n.get("target")
+                        val = n.get("value")
+                        if isinstance(target, str):
+                            alloc_info = self._extract_alloc_call(val)
+                            if alloc_info:
+                                local_allocs[target] = alloc_info[0]
+                            elif isinstance(val, dict) and val.get("type") == "FunctionCallNode":
+                                cname = val.get("name")
+                                if cname in self.function_summaries and self.function_summaries[cname].returns_allocation:
+                                    local_allocs[target] = self.function_summaries[cname].alloc_function
+
+                            # Ownership transfer to global variable: global_var = p;
+                            if target in self.global_vars and isinstance(val, dict) and val.get("type") == "IdentifierNode":
+                                v_id = val.get("name")
+                                if v_id in param_map:
+                                    p_idx = param_map[v_id]
+                                    if p_idx not in summ.transfers_ownership_params:
+                                        summ.transfers_ownership_params.add(p_idx)
+                                        changed = True
+
+                    elif ntype == "ReturnNode":
+                        val_expr = n.get("value")
+                        if val_expr:
+                            alloc_info = self._extract_alloc_call(val_expr)
+                            if alloc_info:
+                                if not summ.returns_allocation:
+                                    summ.returns_allocation = True
+                                    summ.alloc_function = alloc_info[0]
+                                    changed = True
+                            elif isinstance(val_expr, dict) and val_expr.get("type") == "FunctionCallNode":
+                                cname = val_expr.get("name")
+                                if cname in self.function_summaries and self.function_summaries[cname].returns_allocation:
+                                    if not summ.returns_allocation:
+                                        summ.returns_allocation = True
+                                        summ.alloc_function = self.function_summaries[cname].alloc_function
+                                        changed = True
+                            elif isinstance(val_expr, dict) and val_expr.get("type") == "IdentifierNode":
+                                rname = val_expr.get("name")
+                                if rname in local_allocs:
+                                    if not summ.returns_allocation:
+                                        summ.returns_allocation = True
+                                        summ.alloc_function = local_allocs[rname]
+                                        changed = True
+                                elif rname in param_map:
+                                    p_idx = param_map[rname]
+                                    if summ.returned_param_alias != p_idx:
+                                        summ.returned_param_alias = p_idx
+                                        summ.returned_param_is_interior = False
+                                        changed = True
+                            elif isinstance(val_expr, dict) and val_expr.get("type") == "BinaryExpressionNode":
+                                op = val_expr.get("operator")
+                                if op in ("+", "-"):
+                                    l = val_expr.get("left")
+                                    r = val_expr.get("right")
+                                    p_name = None
+                                    if isinstance(l, dict) and l.get("type") == "IdentifierNode" and l.get("name") in param_map:
+                                        p_name = l.get("name")
+                                    elif isinstance(r, dict) and r.get("type") == "IdentifierNode" and r.get("name") in param_map:
+                                        p_name = r.get("name")
+                                    if p_name:
+                                        p_idx = param_map[p_name]
+                                        if summ.returned_param_alias != p_idx or not summ.returned_param_is_interior:
+                                            summ.returned_param_alias = p_idx
+                                            summ.returned_param_is_interior = True
+                                            changed = True
+
+                    elif ntype == "FunctionCallNode":
+                        cname = n.get("name")
+                        args = n.get("args", [])
+                        if cname == name:
+                            summ.is_recursive = True
+                        if cname == "free" and args:
+                            arg0_name = self._extract_identifier_name(args[0])
+                            if arg0_name and arg0_name in param_map:
+                                p_idx = param_map[arg0_name]
+                                if p_idx not in summ.freed_param_indices:
+                                    summ.freed_param_indices.add(p_idx)
+                                    changed = True
+                        elif cname in self.function_summaries:
+                            callee_summ = self.function_summaries[cname]
+                            for c_p_idx in callee_summ.freed_param_indices:
+                                if c_p_idx < len(args):
+                                    a_name = self._extract_identifier_name(args[c_p_idx])
+                                    if a_name and a_name in param_map:
+                                        p_idx = param_map[a_name]
+                                        if p_idx not in summ.freed_param_indices:
+                                            summ.freed_param_indices.add(p_idx)
+                                            changed = True
+                            for c_p_idx in callee_summ.dereferenced_param_indices:
+                                if c_p_idx < len(args):
+                                    a_name = self._extract_identifier_name(args[c_p_idx])
+                                    if a_name and a_name in param_map:
+                                        p_idx = param_map[a_name]
+                                        if p_idx not in summ.dereferenced_param_indices:
+                                            summ.dereferenced_param_indices.add(p_idx)
+                                            changed = True
+                            for c_p_idx in callee_summ.transfers_ownership_params:
+                                if c_p_idx < len(args):
+                                    a_name = self._extract_identifier_name(args[c_p_idx])
+                                    if a_name and a_name in param_map:
+                                        p_idx = param_map[a_name]
+                                        if p_idx not in summ.transfers_ownership_params:
+                                            summ.transfers_ownership_params.add(p_idx)
+                                            changed = True
+
+                    elif ntype == "UnaryExpressionNode" and n.get("operator") == "*":
+                        op_name = self._extract_identifier_name(n.get("operand"))
+                        if op_name and op_name in param_map:
+                            p_idx = param_map[op_name]
+                            if p_idx not in summ.dereferenced_param_indices:
+                                summ.dereferenced_param_indices.add(p_idx)
+                                changed = True
+                    elif ntype == "BinaryExpressionNode" and n.get("operator") in ("->", "[]"):
+                        left_name = self._extract_identifier_name(n.get("left"))
+                        if left_name and left_name in param_map:
+                            p_idx = param_map[left_name]
+                            if p_idx not in summ.dereferenced_param_indices:
+                                summ.dereferenced_param_indices.add(p_idx)
+                                changed = True
+
+                    for k, v in n.items():
+                        if isinstance(v, dict):
+                            scan_node(v)
+                        elif isinstance(v, list):
+                            for item in v:
+                                scan_node(item)
+
+                scan_node(body)
+
+            if not changed:
+                break
+
     def analyze(self) -> List[MemoryAllocation]:
         self.alloc_records = {}
         self.extra_issues = []
         self.alloc_counter = 1
         self.fn_params = set()
+        self.current_function = None
+        self.called_functions: Set[str] = set()
         self.global_vars: Set[str] = set()
         self.in_conditional_depth = 0
         self.in_loop_depth = 0
@@ -112,6 +310,9 @@ class MemoryAnalyzer:
                     var_name = stmt.get("name")
                     if var_name:
                         self.global_vars.add(var_name)
+
+        # Build interprocedural function summaries
+        self._build_function_summaries()
 
         # 1. Walk AST statements
         initial_state = PathState()
@@ -191,6 +392,23 @@ class MemoryAnalyzer:
                 "leaked": False
             }
             return inst
+
+        if self.current_function and self.current_function in self.function_summaries:
+            summ = self.function_summaries[self.current_function]
+            if summ.is_captured:
+                alloc_id = f"sim_{self.alloc_counter}"
+                self.alloc_counter += 1
+                inst = AllocationInstance(alloc_id, fn, line, target_ptr, col)
+                state.alloc_states[alloc_id] = {
+                    "freed": False,
+                    "free_line": None,
+                    "escaped": False,
+                    "owners": {target_ptr} if target_ptr and target_ptr != "unknown_ptr" else set(),
+                    "was_reallocated": False,
+                    "realloc_from": None,
+                    "leaked": False
+                }
+                return inst
 
         alloc_id = f"alloc_{self.alloc_counter}"
         self.alloc_counter += 1
@@ -512,6 +730,16 @@ class MemoryAnalyzer:
 
         return None
 
+    def _extract_identifier_name(self, expr: Any) -> Optional[str]:
+        """Extracts the identifier name from an expression node if applicable."""
+        if not isinstance(expr, dict):
+            return None
+        if expr.get("type") == "IdentifierNode":
+            return expr.get("name")
+        if expr.get("type") == "UnaryExpressionNode":
+            return self._extract_identifier_name(expr.get("operand"))
+        return None
+
     def _extract_deref_base_name(self, target: str, state: PathState) -> Optional[str]:
         """Extracts the base pointer variable from a dereference assignment target (e.g. *p, *(p + 1), *q)."""
         if not isinstance(target, str) or not target.startswith("*"):
@@ -606,11 +834,72 @@ class MemoryAnalyzer:
             if fn_name in ("puts", "strlen", "fputs"):
                 if args and isinstance(args[0], dict) and args[0].get("type") == "IdentifierNode":
                     self._report_uaf_if_freed(args[0].get("name"), line, state)
+            elif fn_name in self.function_summaries:
+                summ = self.function_summaries[fn_name]
+                for p_idx in summ.dereferenced_param_indices:
+                    if p_idx < len(args):
+                        arg_name = self._extract_identifier_name(args[p_idx])
+                        if arg_name:
+                            self._report_uaf_if_freed(arg_name, line, state)
             for arg in args:
                 self._check_use_after_free(arg, line, state)
 
     def _handle_pointer_assignment(self, target: str, expr: Any, line: int, state: PathState):
         """Tracks allocation assignment, pointer aliasing, address-of assignments, and NULL overwrites."""
+        # Case 0: Assignment from a function call to a summarized helper
+        if isinstance(expr, dict) and expr.get("type") == "FunctionCallNode":
+            fn_name = expr.get("name")
+            args = expr.get("args", [])
+            self.called_functions.add(fn_name)
+            if fn_name in self.function_summaries:
+                summ = self.function_summaries[fn_name]
+                # Check if helper returns an alias to one of its arguments
+                if summ.returned_param_alias is not None:
+                    p_idx = summ.returned_param_alias
+                    if p_idx < len(args):
+                        arg_name = self._extract_identifier_name(args[p_idx])
+                        if arg_name:
+                            self._check_and_orphan(target, state)
+                            base_alloc = state.env.get(arg_name)
+                            if summ.returned_param_is_interior:
+                                if isinstance(base_alloc, str) and base_alloc.startswith("maybe:"):
+                                    base_alloc = base_alloc.split(":", 1)[1]
+                                state.env[target] = f"interior:{base_alloc}" if base_alloc else "interior:unknown"
+                            else:
+                                state.env[target] = base_alloc
+                                if base_alloc:
+                                    clean_id = base_alloc.split(":", 1)[1] if str(base_alloc).startswith("maybe:") else base_alloc
+                                    if clean_id in state.alloc_states:
+                                        state.alloc_states[clean_id]["owners"].add(target)
+                            return
+
+                # Check if helper returns a newly allocated buffer
+                if summ.returns_allocation:
+                    self._check_and_orphan(target, state)
+                    is_cond = (self.in_conditional_depth > 0 or self.in_loop_depth > 0)
+                    if summ.escaped_alloc_id and summ.escaped_alloc_id in self.alloc_records and not summ.is_captured:
+                        inst = self.alloc_records[summ.escaped_alloc_id]
+                        inst.target_ptr = target
+                        inst.escaped = False
+                        inst.path_outcomes = []
+                        state.alloc_states[inst.alloc_id] = {
+                            "freed": False,
+                            "free_line": None,
+                            "escaped": False,
+                            "owners": {target},
+                            "was_reallocated": False,
+                            "realloc_from": None,
+                            "leaked": False,
+                            "maybe_freed": False
+                        }
+                        state.env[target] = inst.alloc_id
+                        summ.is_captured = True
+                    else:
+                        inst = self._create_allocation(summ.alloc_function, line, target, state, is_conditional=is_cond)
+                        state.env[target] = inst.alloc_id
+                        summ.is_captured = True
+                    return
+
         alloc_info = self._extract_alloc_call(expr)
 
         # Case A: Assignment to a new allocation (malloc / calloc / realloc)
@@ -838,13 +1127,23 @@ class MemoryAnalyzer:
 
     def _handle_return(self, val_expr: Any, line: int, state: PathState):
         """Handles return statement: marks escaping pointers and flags early-exit leaks."""
-        if isinstance(val_expr, dict) and val_expr.get("type") == "IdentifierNode":
+        alloc_info = self._extract_alloc_call(val_expr)
+        if alloc_info:
+            fn_name, args, alloc_line = alloc_info
+            inst = self._create_allocation(fn_name, alloc_line or line, "return_val", state)
+            state.alloc_states[inst.alloc_id]["escaped"] = True
+            inst.escaped = True
+            if self.current_function and self.current_function in self.function_summaries:
+                self.function_summaries[self.current_function].escaped_alloc_id = inst.alloc_id
+        elif isinstance(val_expr, dict) and val_expr.get("type") == "IdentifierNode":
             ret_ptr = val_expr.get("name")
             alloc_id = state.env.get(ret_ptr)
             if alloc_id and alloc_id in state.alloc_states:
                 state.alloc_states[alloc_id]["escaped"] = True
                 if alloc_id in self.alloc_records:
                     self.alloc_records[alloc_id].escaped = True
+                if self.current_function and self.current_function in self.function_summaries:
+                    self.function_summaries[self.current_function].escaped_alloc_id = alloc_id
 
         state.returned = True
         state.return_line = line
@@ -1083,6 +1382,8 @@ class MemoryAnalyzer:
             self._walk_statements(node.get("statements", []), state)
 
         elif node_type == "FunctionDeclarationNode":
+            fn_name = node.get("name")
+            self.current_function = fn_name
             prev_params = self.fn_params
             self.fn_params = set(node.get("params", []))
             fn_state = PathState()
@@ -1092,6 +1393,7 @@ class MemoryAnalyzer:
             if not fn_state.returned:
                 self._record_path_completion(fn_state)
             self.fn_params = prev_params
+            self.current_function = None
 
         elif node_type == "BlockNode":
             state.scopes.append(set())
@@ -1163,8 +1465,36 @@ class MemoryAnalyzer:
             fn_name = node.get("name")
             args = node.get("args", [])
             line = node.get("line", 1)
+            self.called_functions.add(fn_name)
+
             if fn_name == "free":
                 self._handle_free_call(args, line, state)
+            elif fn_name in self.function_summaries:
+                summ = self.function_summaries[fn_name]
+                # Check dereferenced parameters for UAF
+                for p_idx in summ.dereferenced_param_indices:
+                    if p_idx < len(args):
+                        arg_name = self._extract_identifier_name(args[p_idx])
+                        if arg_name:
+                            self._report_uaf_if_freed(arg_name, line, state)
+
+                # Check freed parameters
+                for p_idx in summ.freed_param_indices:
+                    if p_idx < len(args):
+                        self._handle_free_call([args[p_idx]], line, state)
+
+                # Check ownership transfer
+                for p_idx in summ.transfers_ownership_params:
+                    if p_idx < len(args):
+                        arg_name = self._extract_identifier_name(args[p_idx])
+                        if arg_name:
+                            aid = state.env.get(arg_name)
+                            if aid and aid in state.alloc_states:
+                                state.alloc_states[aid]["escaped"] = True
+                                if aid in self.alloc_records:
+                                    self.alloc_records[aid].escaped = True
+
+                self._check_use_after_free(node, line, state)
             else:
                 self._check_use_after_free(node, line, state)
 

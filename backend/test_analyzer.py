@@ -3163,8 +3163,325 @@ class TestPhase3CControlFlowLoopsAndScopes(unittest.TestCase):
         self.assertEqual(uaf[0].severity, "error")
 
 
+class TestPhase3DInterproceduralAnalysis(unittest.TestCase):
+    """
+    Phase 3D Regression Test Suite:
+    Interprocedural Analysis, Pointer Aliases, Function Summaries & Ownership.
+    """
+
+    def test_allocation_returned_from_helper_and_freed_by_caller(self):
+        """Phase 3D: Heap allocation returned from helper and freed by caller is SAFE."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int *create_data(void) {
+    return malloc(16);
+}
+int main() {
+    int *p = create_data();
+    free(p);
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.memory_analysis), 1)
+        self.assertEqual(res.memory_analysis[0].status, "SAFE")
+        self.assertTrue(res.memory_analysis[0].freed)
+        self.assertEqual(len(res.anomalies), 0)
+
+    def test_allocation_returned_from_helper_and_never_freed(self):
+        """Phase 3D: Heap allocation returned from helper but never freed is reported as DEFINITE LEAK with safe-fix."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int *create_data(void) {
+    return malloc(16);
+}
+int main() {
+    int *p = create_data();
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.memory_analysis), 1)
+        self.assertEqual(res.memory_analysis[0].status, "DEFINITE LEAK")
+        self.assertEqual(res.memory_analysis[0].severity, "error")
+        leaks = [a for a in res.anomalies if a.issue_type == "MEMORY LEAK"]
+        self.assertEqual(len(leaks), 1)
+        suggs = [s for s in res.suggestions if s.category == "MEMORY"]
+        self.assertEqual(len(suggs), 1)
+        self.assertIsNotNone(suggs[0].safe_fix)
+
+    def test_helper_frees_caller_owned_allocation(self):
+        """Phase 3D: Helper function freeing caller's allocation marks it freed without false leak."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """void release_data(int *p) {
+    free(p);
+}
+int main() {
+    int *p = malloc(16);
+    release_data(p);
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.memory_analysis), 1)
+        self.assertEqual(res.memory_analysis[0].status, "SAFE")
+        self.assertTrue(res.memory_analysis[0].freed)
+        self.assertEqual(len(res.anomalies), 0)
+
+    def test_caller_dereferencing_after_helper_free(self):
+        """Phase 3D: Caller dereferencing a pointer after helper frees it is detected as USE AFTER FREE."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """void release_data(int *p) {
+    free(p);
+}
+int main() {
+    int *p = malloc(16);
+    release_data(p);
+    *p = 42;
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        uafs = [a for a in res.anomalies if a.issue_type == "USE AFTER FREE"]
+        self.assertEqual(len(uafs), 1)
+        self.assertEqual(uafs[0].severity, "error")
+
+    def test_caller_double_free_after_helper_free(self):
+        """Phase 3D: Calling free() after a helper already freed the pointer is detected as DOUBLE FREE."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """void release_data(int *p) {
+    free(p);
+}
+int main() {
+    int *p = malloc(16);
+    release_data(p);
+    free(p);
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        dfs = [a for a in res.anomalies if a.issue_type == "DOUBLE FREE"]
+        self.assertEqual(len(dfs), 1)
+        self.assertEqual(dfs[0].severity, "error")
+
+    def test_helper_reading_writing_parameter_propagates_uaf(self):
+        """Phase 3D: Passing a freed pointer to a helper that dereferences it propagates USE AFTER FREE."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """void inspect(int *p) {
+    printf("%d", *p);
+}
+int main() {
+    int *p = malloc(16);
+    free(p);
+    inspect(p);
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        uafs = [a for a in res.anomalies if a.issue_type == "USE AFTER FREE"]
+        self.assertEqual(len(uafs), 1)
+        self.assertEqual(uafs[0].severity, "error")
+
+    def test_helper_reading_parameter_clean_when_not_freed(self):
+        """Phase 3D: Passing an active allocation to a reading helper followed by free is completely clean."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """void inspect(int *p) {
+    printf("%d", *p);
+}
+int main() {
+    int *p = malloc(16);
+    inspect(p);
+    free(p);
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.memory_analysis), 1)
+        self.assertEqual(res.memory_analysis[0].status, "SAFE")
+        self.assertEqual(len(res.anomalies), 0)
+
+    def test_returning_alias_to_parameter(self):
+        """Phase 3D: Function returning parameter alias followed by freeing both reports DOUBLE FREE."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int *get_alias(int *p) {
+    return p;
+}
+int main() {
+    int *p = malloc(16);
+    int *q = get_alias(p);
+    free(p);
+    free(q);
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        dfs = [a for a in res.anomalies if a.issue_type == "DOUBLE FREE"]
+        self.assertEqual(len(dfs), 1)
+        self.assertEqual(dfs[0].severity, "error")
+
+    def test_returning_interior_alias_to_parameter(self):
+        """Phase 3D: Function returning interior pointer alias followed by free reports INVALID FREE."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int *get_interior(int *p) {
+    return p + 2;
+}
+int main() {
+    int *p = malloc(16);
+    int *q = get_interior(p);
+    free(q);
+    free(p);
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        invs = [a for a in res.anomalies if a.issue_type == "INVALID FREE"]
+        self.assertEqual(len(invs), 1)
+        self.assertEqual(invs[0].severity, "error")
+
+    def test_multi_hop_parameter_passing_and_free(self):
+        """Phase 3D: Freeing through multi-hop helper call chain cleanly releases caller allocation."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """void free_leaf(int *x) {
+    free(x);
+}
+void free_intermediate(int *y) {
+    if (y != NULL) {
+        free_leaf(y);
+    }
+}
+int main() {
+    int *p = malloc(16);
+    free_intermediate(p);
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.memory_analysis), 1)
+        self.assertEqual(res.memory_analysis[0].status, "SAFE")
+        self.assertTrue(res.memory_analysis[0].freed)
+        mem_issues = [a for a in res.anomalies if a.issue_type in ("MEMORY LEAK", "DOUBLE FREE", "INVALID FREE", "USE AFTER FREE")]
+        self.assertEqual(len(mem_issues), 0)
+
+    def test_ownership_transfer_to_global_vs_borrowing(self):
+        """Phase 3D: Global pointer storage transfers ownership (escaped); borrowing preserves local ownership."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        # 1. Global ownership transfer
+        code_transfer = """int *g_ptr = NULL;
+void transfer(int *p) {
+    g_ptr = p;
+}
+int main() {
+    int *p = malloc(16);
+    transfer(p);
+    return 0;
+}"""
+        res_t = analyze_code(AnalyzeRequest(code=code_transfer))
+        self.assertEqual(res_t.memory_analysis[0].status, "ESCAPED")
+        leaks_t = [a for a in res_t.anomalies if a.issue_type == "MEMORY LEAK"]
+        self.assertEqual(len(leaks_t), 0)
+
+        # 2. Borrowing only: unreleased pointer is definite leak
+        code_borrow = """void borrow(int *p) {
+    int val = *p;
+}
+int main() {
+    int *p = malloc(16);
+    borrow(p);
+    return 0;
+}"""
+        res_b = analyze_code(AnalyzeRequest(code=code_borrow))
+        self.assertEqual(res_b.memory_analysis[0].status, "DEFINITE LEAK")
+
+    def test_unknown_external_call_preserves_state(self):
+        """Phase 3D: Unknown external function calls do not erase known allocation/freed state."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """void external_logger(int *p);
+int main() {
+    int *p = malloc(16);
+    external_logger(p);
+    free(p);
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.memory_analysis), 1)
+        self.assertEqual(res.memory_analysis[0].status, "SAFE")
+        self.assertTrue(res.memory_analysis[0].freed)
+        self.assertEqual(len(res.anomalies), 0)
+
+    def test_recursive_function_cleanup(self):
+        """Phase 3D: Bounded summary computation handles recursion safely and propagates cleanup."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """void rec_cleanup(int *p, int n) {
+    if (n <= 0) {
+        free(p);
+        return;
+    }
+    rec_cleanup(p, n - 1);
+}
+int main() {
+    int *p = malloc(16);
+    rec_cleanup(p, 5);
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.memory_analysis), 1)
+        self.assertEqual(res.memory_analysis[0].status, "SAFE")
+        self.assertTrue(res.memory_analysis[0].freed)
+
+    def test_function_definitions_appearing_after_call_sites(self):
+        """Phase 3D: Helper function defined after caller is summarized and tracked correctly."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int main() {
+    int *p = create_data();
+    free(p);
+    return 0;
+}
+int *create_data(void) {
+    return malloc(16);
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.memory_analysis), 1)
+        self.assertEqual(res.memory_analysis[0].status, "SAFE")
+        self.assertTrue(res.memory_analysis[0].freed)
+
+    def test_cross_function_invalid_free_stack_address(self):
+        """Phase 3D: Passing stack address to a helper that frees it reports INVALID FREE."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """void release(int *p) {
+    free(p);
+}
+int main() {
+    int x = 42;
+    release(&x);
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        invs = [a for a in res.anomalies if a.issue_type == "INVALID FREE"]
+        self.assertEqual(len(invs), 1)
+        self.assertEqual(invs[0].severity, "error")
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
