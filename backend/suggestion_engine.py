@@ -107,20 +107,35 @@ class SuggestionEngine:
             suggestion_id += 1
 
         # 3. Memory Issues
+        seen_mem_diagnostics = set()
         for mem in self.memory_analysis:
+            diag_line = mem.free_line or mem.allocation_line
+            diag_key = (mem.status, mem.pointer, diag_line)
+            if diag_key in seen_mem_diagnostics:
+                continue
+            seen_mem_diagnostics.add(diag_key)
+
             if mem.status in ("POSSIBLE LEAK", "DEFINITE LEAK"):
                 is_definite = mem.status == "DEFINITE LEAK"
                 if is_definite:
-                    msg = f"Memory allocated to pointer '{mem.pointer}' via {mem.allocation_function}() is definitely leaked (pointer overwritten or lost to scope exit)."
+                    issue_type = "MEMORY LEAK"
+                    severity = "error"
+                    title = "Memory Leak Prevention"
+                    msg = f"Definite memory leak: memory allocated to pointer '{mem.pointer}' via {mem.allocation_function}() is definitely leaked (pointer overwritten or lost to scope exit)."
+                    why = "Unreleased heap memory stays occupied until program termination, leading to memory exhaustion and resource depletion."
+                    sugg = f"Add free({mem.pointer}); before overwriting or exiting scope."
                 else:
-                    msg = f"Memory allocated to pointer '{mem.pointer}' via {mem.allocation_function}() was not freed or may leak on failure."
-                why = "Unreleased memory allocations stay occupied on the heap, leading to memory leaks and resource depletion."
-                sugg = f"Add free({mem.pointer}); before overwriting or exiting scope."
-                
+                    issue_type = "POSSIBLE LEAK"
+                    severity = "warning"
+                    title = "Possible Memory Leak Warning"
+                    msg = f"Possible memory leak: memory allocated to pointer '{mem.pointer}' via {mem.allocation_function}() may remain unreleased on at least one analyzed execution path."
+                    why = "At least one analyzed path (such as a conditional branch, loop, or early exit) may leave this allocation unreleased."
+                    sugg = f"Review allocation ownership and all exit paths to ensure '{mem.pointer}' is freed on every execution path, or verify error and branch handling."
+
                 anomalies.append(Anomaly(
                     id=anomaly_id,
-                    issue_type="MEMORY LEAK",
-                    severity="error" if is_definite else "warning",
+                    issue_type=issue_type,
+                    severity=severity,
                     line=mem.allocation_line,
                     column=1,
                     message=msg,
@@ -129,7 +144,7 @@ class SuggestionEngine:
                 ))
                 anomaly_id += 1
 
-                # Safe fixes only: do not automatically suggest free(ptr) unless safely justified
+                # Safe fixes only: only offer automatic fix when strictly safe and local (never for possible leaks)
                 safe_fix = None
                 orig_snippet = None
                 fixed_snippet = None
@@ -137,13 +152,14 @@ class SuggestionEngine:
                 fix_explanation = None
                 target_line = None
 
-                free_info = self._get_safe_free_fix(mem.pointer, mem.allocation_line)
-                if free_info:
-                    orig_snippet, fixed_snippet, safe_fix, fix_type, fix_explanation, target_line = free_info
+                if is_definite:
+                    free_info = self._get_safe_free_fix(mem.pointer, mem.allocation_line)
+                    if free_info:
+                        orig_snippet, fixed_snippet, safe_fix, fix_type, fix_explanation, target_line = free_info
 
                 suggestions.append(SuggestionItem(
                     id=suggestion_id,
-                    title="Memory Leak Prevention",
+                    title=title,
                     message=msg,
                     suggestion=sugg,
                     line=mem.allocation_line,
@@ -157,15 +173,27 @@ class SuggestionEngine:
                 ))
                 suggestion_id += 1
 
-            elif mem.status == "DOUBLE FREE":
-                msg = f"Pointer '{mem.pointer}' freed multiple times."
-                why = "Calling free() twice on the same memory pointer leads to heap corruption and undefined behavior."
-                sugg = f"Ensure free({mem.pointer}); is executed exactly once per allocation."
+            elif mem.status in ("DOUBLE FREE", "POSSIBLE DOUBLE FREE"):
+                is_definite = mem.status == "DOUBLE FREE"
+                if is_definite:
+                    msg = f"Definite double-free: pointer '{mem.pointer}' releases an allocation that has already been freed along the analyzed execution path."
+                    issue_type = "DOUBLE FREE"
+                    severity = "error"
+                    title = "Double Free Fix"
+                    why = "The same allocation is released more than once along the analyzed execution path, causing heap corruption and undefined behavior."
+                    sugg = f"Remove redundant free({mem.pointer}); calls so the allocation is released exactly once along this execution path."
+                else:
+                    msg = f"Possible double-free: pointer '{mem.pointer}' may have already been freed along an alternate control-flow path."
+                    issue_type = "POSSIBLE DOUBLE FREE"
+                    severity = "warning"
+                    title = "Possible Double Free Warning"
+                    why = "The allocation may already have been released on another execution path; calling free() again along an intersecting path causes heap corruption."
+                    sugg = f"Review control-flow paths to ensure '{mem.pointer}' (and its aliases) is freed at most once across all branches, or restructure branches to be mutually exclusive."
 
                 anomalies.append(Anomaly(
                     id=anomaly_id,
-                    issue_type="DOUBLE FREE",
-                    severity="error",
+                    issue_type=issue_type,
+                    severity=severity,
                     line=mem.free_line or mem.allocation_line,
                     column=1,
                     message=msg,
@@ -176,7 +204,7 @@ class SuggestionEngine:
 
                 suggestions.append(SuggestionItem(
                     id=suggestion_id,
-                    title="Double Free Fix",
+                    title=title,
                     message=msg,
                     suggestion=sugg,
                     line=mem.free_line or mem.allocation_line,
@@ -186,9 +214,9 @@ class SuggestionEngine:
                 suggestion_id += 1
 
             elif mem.status == "USE AFTER FREE":
-                msg = f"Use-after-free: pointer '{mem.pointer}' is accessed/dereferenced on line {mem.free_line or mem.allocation_line} after its memory has been freed."
-                why = "Dereferencing a pointer to freed memory causes heap corruption, undefined behavior, crashes, or security exploits."
-                sugg = f"Do not access '{mem.pointer}' after calling free(); set pointer to NULL or allocate fresh memory before dereferencing."
+                msg = f"Use-after-free: pointer '{mem.pointer}' is accessed or dereferenced on line {mem.free_line or mem.allocation_line} after its memory has been released."
+                why = "The pointer refers to an allocation that has already been released; accessing freed memory causes undefined behavior, heap corruption, or security vulnerabilities."
+                sugg = f"Inspect the access to '{mem.pointer}' and its allocation lifetime; ensure the memory is not accessed after calling free(), or restructure the code so the allocation outlives all accesses."
 
                 anomalies.append(Anomaly(
                     id=anomaly_id,
@@ -214,9 +242,22 @@ class SuggestionEngine:
                 suggestion_id += 1
 
             elif mem.status == "INVALID FREE":
-                msg = f"Invalid free: attempted to free pointer '{mem.pointer}' on line {mem.free_line or mem.allocation_line}, which does not reference a valid dynamic heap allocation."
-                why = "Calling free() on a stack, local, or unallocated pointer causes heap corruption, abort signals, and runtime crashes."
-                sugg = f"Do not call free({mem.pointer}); only heap memory allocated via malloc, calloc, or realloc may be passed to free()."
+                if mem.allocation_function == "string_literal":
+                    msg = f"Invalid free: attempted to free string literal or read-only memory '{mem.pointer}' on line {mem.free_line or mem.allocation_line}."
+                    why = "free() requires a dynamically allocated heap address; string literals reside in read-only memory (.rodata) and must not be freed."
+                    sugg = f"Do not call free({mem.pointer}); string literals are statically managed and cannot be released."
+                elif mem.allocation_function == "global":
+                    msg = f"Invalid free: attempted to free static/global variable address '{mem.pointer}' on line {mem.free_line or mem.allocation_line}."
+                    why = "free() requires a dynamic heap allocation address; global and static variables reside in fixed memory segments (.data/.bss) and must not be freed."
+                    sugg = f"Do not call free({mem.pointer}); only dynamic heap allocations from malloc(), calloc(), or realloc() may be passed to free()."
+                elif mem.allocation_function == "interior":
+                    msg = f"Invalid free: attempted to free interior/offset pointer '{mem.pointer}' on line {mem.free_line or mem.allocation_line}."
+                    why = "free() requires the original allocation base address returned by malloc(), calloc(), or realloc(); an interior pointer must not be freed."
+                    sugg = f"Pass the base pointer returned by dynamic allocation to free(), not an interior or offset pointer."
+                else:
+                    msg = f"Invalid free: attempted to free pointer '{mem.pointer}' on line {mem.free_line or mem.allocation_line}, which does not reference a valid dynamic heap allocation."
+                    why = "free() requires the original allocation address; stack, local, or unallocated addresses must not be freed. Calling free() on a stack, local, or unallocated pointer causes heap corruption, abort signals, and runtime crashes."
+                    sugg = f"Do not call free({mem.pointer}); only heap memory allocated via malloc, calloc, or realloc may be passed to free()."
 
                 anomalies.append(Anomaly(
                     id=anomaly_id,

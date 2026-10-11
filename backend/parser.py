@@ -183,11 +183,32 @@ class Parser:
             self.advance()
             return None
 
-        # 5. Variable declaration
+        # 5. Struct definition or struct variable declaration
+        if tok.lexeme == 'struct':
+            p1 = self.peek_token(1)
+            p2 = self.peek_token(2)
+            if p2 and p2.lexeme == '{':
+                # struct Tag { ... };
+                self.advance()  # struct
+                tag_tok = self.advance()  # Tag
+                self.advance()  # {
+                fields = []
+                while self.current_token() and self.current_token().lexeme != '}':
+                    stmt = self.parse_statement()
+                    if stmt:
+                        fields.append(stmt)
+                if self.match("SEPARATOR", "}"):
+                    self.advance()  # }
+                self.check_semicolon()
+                return create_block_node(fields, tok.line)
+            else:
+                return self.parse_struct_declaration(expect_semicolon=True)
+
+        # 6. Variable declaration
         if tok.token_type == "KEYWORD" and tok.lexeme in TYPES:
             return self.parse_declaration(expect_semicolon=True)
 
-        # 6. Pointer dereference assignment e.g. *ptr = expr;
+        # 7. Pointer dereference assignment e.g. *ptr = expr; or *(ptr + offset) = expr;
         if tok.lexeme == '*':
             p1 = self.peek_token(1)
             p2 = self.peek_token(2)
@@ -198,14 +219,92 @@ class Parser:
                 val = self.parse_expression()
                 self.check_semicolon()
                 return create_assignment_node(f"*{target.lexeme}", val, tok.line)
+            elif p1 and p1.lexeme == '(':
+                # Check for assignment to parenthesized dereference e.g. *(p + 1) = 42;
+                idx = 1
+                depth = 0
+                found_assign = False
+                inner_lexemes = []
+                while idx < len(self.tokens) - self.pos:
+                    tk = self.peek_token(idx)
+                    if not tk:
+                        break
+                    if tk.lexeme == '(':
+                        depth += 1
+                        if depth > 1:
+                            inner_lexemes.append(tk.lexeme)
+                    elif tk.lexeme == ')':
+                        depth -= 1
+                        if depth == 0:
+                            next_tk = self.peek_token(idx + 1)
+                            if next_tk and next_tk.lexeme in ("=", "+=", "-=", "*=", "/=", "%="):
+                                found_assign = True
+                            break
+                        else:
+                            inner_lexemes.append(tk.lexeme)
+                    else:
+                        inner_lexemes.append(tk.lexeme)
+                    idx += 1
 
-        # 7. Assignment statement e.g. x = expr; or x += expr;
+                if found_assign:
+                    self.advance()  # '*'
+                    self.advance()  # '('
+                    inner_expr = self.parse_expression()
+                    if self.match("SEPARATOR", ")"):
+                        self.advance()  # ')'
+                    op_tok = self.advance()  # '='
+                    val_expr = self.parse_expression()
+                    self.check_semicolon()
+                    inner_str = " ".join(inner_lexemes)
+                    return create_assignment_node(f"*({inner_str})", val_expr, tok.line)
+
+        # 8. Assignment statement e.g. x = expr; or node->next = expr; or p[idx] = expr;
         if tok.token_type == "IDENTIFIER":
             p1 = self.peek_token(1)
             if p1 and p1.lexeme in ("=", "+=", "-=", "*=", "/=", "%="):
                 return self.parse_assignment()
+            if p1 and p1.lexeme in ("->", "."):
+                p2 = self.peek_token(2)
+                p3 = self.peek_token(3)
+                if p2 and p2.token_type == "IDENTIFIER" and p3 and p3.lexeme in ("=", "+=", "-=", "*=", "/=", "%="):
+                    target_tok = self.advance()
+                    arrow_tok = self.advance()
+                    field_tok = self.advance()
+                    op_tok = self.advance()
+                    val_expr = self.parse_expression()
+                    self.check_semicolon()
+                    return create_assignment_node(f"{target_tok.lexeme}{arrow_tok.lexeme}{field_tok.lexeme}", val_expr, target_tok.line)
+            if p1 and p1.lexeme == '[':
+                idx = 1
+                depth = 0
+                found_assign = False
+                while idx < len(self.tokens) - self.pos:
+                    tk = self.peek_token(idx)
+                    if not tk:
+                        break
+                    if tk.lexeme == '[':
+                        depth += 1
+                    elif tk.lexeme == ']':
+                        depth -= 1
+                        if depth == 0:
+                            next_tk = self.peek_token(idx + 1)
+                            if next_tk and next_tk.lexeme in ("=", "+=", "-=", "*=", "/=", "%="):
+                                found_assign = True
+                            break
+                    idx += 1
 
-        # 8. Expression statement (function calls func(...);, post/pre increments i++;, etc.)
+                if found_assign:
+                    target_tok = self.advance()
+                    self.advance()  # '['
+                    idx_expr = self.parse_expression()
+                    if self.match("SEPARATOR", "]"):
+                        self.advance()  # ']'
+                    op_tok = self.advance()  # '='
+                    val_expr = self.parse_expression()
+                    self.check_semicolon()
+                    return create_assignment_node(f"{target_tok.lexeme}[]", val_expr, target_tok.line)
+
+        # 9. Expression statement (function calls func(...);, post/pre increments i++;, etc.)
         expr = self.parse_expression()
         self.check_semicolon()
         return expr
@@ -230,6 +329,29 @@ class Parser:
             self.check_semicolon()
 
         return create_declaration_node(type_tok.lexeme if type_tok else "int", var_name, is_ptr, initializer, line)
+
+    def parse_struct_declaration(self, expect_semicolon: bool = True) -> Optional[Dict[str, Any]]:
+        struct_tok = self.advance()
+        tag_tok = self.consume("IDENTIFIER", error_msg="Expected struct tag name")
+        var_type = f"struct {tag_tok.lexeme}" if tag_tok else "struct"
+        is_ptr = False
+        if self.match("OPERATOR", "*"):
+            is_ptr = True
+            self.advance()
+
+        name_tok = self.consume("IDENTIFIER", error_msg="Expected identifier in variable declaration")
+        var_name = name_tok.lexeme if name_tok else "var"
+        line = struct_tok.line if struct_tok else 1
+
+        initializer = None
+        if self.match("OPERATOR", "="):
+            self.advance()
+            initializer = self.parse_expression()
+
+        if expect_semicolon:
+            self.check_semicolon()
+
+        return create_declaration_node(var_type, var_name, is_ptr, initializer, line)
 
     def parse_assignment(self) -> Optional[Dict[str, Any]]:
         target_tok = self.advance()
@@ -462,6 +584,10 @@ class Parser:
                 if self.current_token() and self.current_token().lexeme in TYPES:
                     t_tok = self.advance()
                     operand = create_identifier_node(t_tok.lexeme, t_tok.line)
+                elif self.current_token() and self.current_token().lexeme == "struct":
+                    self.advance()  # struct
+                    t_tok = self.advance() if self.current_token() else None
+                    operand = create_identifier_node(f"struct {t_tok.lexeme if t_tok else ''}", sz_tok.line)
                 else:
                     operand = self.parse_expression()
                 self.consume("SEPARATOR", ")", error_msg="Expected ')' after sizeof")
@@ -500,11 +626,19 @@ class Parser:
         if not tok:
             return None
 
-        # Parenthesized expression or type cast: ( expr ) or ( type * ) expr
+        # Parenthesized expression or type cast: ( expr ) or ( type * ) expr or ( struct Tag * ) expr
         if tok.lexeme == '(':
             p1 = self.peek_token(1)
             p2 = self.peek_token(2)
             p3 = self.peek_token(3)
+            p4 = self.peek_token(4)
+            if p1 and p1.lexeme == "struct" and p2 and p2.token_type == "IDENTIFIER" and p3 and p3.lexeme == '*' and p4 and p4.lexeme == ')':
+                self.advance()  # '('
+                self.advance()  # struct
+                self.advance()  # Tag
+                self.advance()  # '*'
+                self.advance()  # ')'
+                return self.parse_unary_expression()
             if p1 and p1.token_type == "KEYWORD" and p1.lexeme in TYPES:
                 if p2 and p2.lexeme == '*' and p3 and p3.lexeme == ')':
                     # Typecast with pointer e.g. (int *) or (char *)

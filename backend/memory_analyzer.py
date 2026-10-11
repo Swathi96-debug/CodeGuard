@@ -1,3 +1,4 @@
+import re
 from typing import List, Dict, Optional, Any, Set, Tuple
 from models import Token, MemoryAllocation, SymbolEntry
 from parser import Parser
@@ -28,6 +29,7 @@ class PathState:
         self.env: Dict[str, Optional[str]] = {}
         # alloc_id -> dict with keys: freed, free_line, escaped, owners, was_reallocated, realloc_from, leaked
         self.alloc_states: Dict[str, Dict[str, Any]] = {}
+        self.scopes: List[Set[str]] = [set()]
         self.returned: bool = False
         self.return_line: Optional[int] = None
         self.broken: bool = False
@@ -45,10 +47,12 @@ class PathState:
                 "owners": set(st["owners"]),
                 "was_reallocated": st.get("was_reallocated", False),
                 "realloc_from": st.get("realloc_from"),
-                "leaked": st.get("leaked", False)
+                "leaked": st.get("leaked", False),
+                "maybe_freed": st.get("maybe_freed", False)
             }
             for aid, st in self.alloc_states.items()
         }
+        cp.scopes = [set(s) for s in self.scopes]
         cp.returned = self.returned
         cp.return_line = self.return_line
         cp.broken = self.broken
@@ -92,8 +96,20 @@ class MemoryAnalyzer:
         self.extra_issues = []
         self.alloc_counter = 1
         self.fn_params = set()
+        self.global_vars: Set[str] = set()
         self.in_conditional_depth = 0
         self.in_loop_depth = 0
+
+        # Register global variables from symbol table and AST
+        for entry in self.symbol_table:
+            if entry.scope == "Global" and not entry.type.endswith("()") and "Function" not in entry.type:
+                self.global_vars.add(entry.name)
+        if self.ast and isinstance(self.ast, dict):
+            for stmt in self.ast.get("statements", []):
+                if isinstance(stmt, dict) and stmt.get("type") == "DeclarationNode":
+                    var_name = stmt.get("name")
+                    if var_name:
+                        self.global_vars.add(var_name)
 
         # 1. Walk AST statements
         initial_state = PathState()
@@ -186,7 +202,8 @@ class MemoryAnalyzer:
             "owners": {target_ptr} if target_ptr and target_ptr != "unknown_ptr" else set(),
             "was_reallocated": False,
             "realloc_from": None,
-            "leaked": False
+            "leaked": False,
+            "maybe_freed": False
         }
         return inst
 
@@ -218,15 +235,21 @@ class MemoryAnalyzer:
                 "owners": set(st["owners"]),
                 "was_reallocated": st.get("was_reallocated", False),
                 "realloc_from": st.get("realloc_from"),
-                "leaked": st.get("leaked", False)
+                "leaked": st.get("leaked", False),
+                "maybe_freed": st.get("maybe_freed", False)
             }
             for aid, st in src.alloc_states.items()
         }
+        dest.scopes = [set(s) for s in src.scopes]
         dest.returned = src.returned
         dest.return_line = src.return_line
         dest.broken = src.broken
         dest.continued = src.continued
         dest.path_completed = src.path_completed
+
+    def _is_local_var(self, name: str, state: PathState) -> bool:
+        """Returns True if name is declared in any active local scope on this path."""
+        return any(name in s for s in state.scopes)
 
     def _merge_states(self, state_a: PathState, state_b: PathState, state_out: PathState):
         """Merges two continuing control flow paths conservatively into state_out."""
@@ -259,6 +282,9 @@ class MemoryAnalyzer:
                         self.alloc_records[aid].status = "POSSIBLE LEAK"
                         self.alloc_records[aid].severity = "warning"
 
+                was_maybe_freed = st_a.get("maybe_freed", False) or st_b.get("maybe_freed", False)
+                merged_maybe_freed = (either_freed and not both_freed) or (was_maybe_freed and not both_freed)
+
                 merged_allocs[aid] = {
                     "freed": both_freed,
                     "free_line": st_a.get("free_line") or st_b.get("free_line"),
@@ -266,14 +292,19 @@ class MemoryAnalyzer:
                     "owners": st_a["owners"].union(st_b["owners"]),
                     "was_reallocated": st_a.get("was_reallocated", False) or st_b.get("was_reallocated", False),
                     "realloc_from": st_a.get("realloc_from") or st_b.get("realloc_from"),
-                    "leaked": st_a.get("leaked", False) and st_b.get("leaked", False)
+                    "leaked": st_a.get("leaked", False) and st_b.get("leaked", False),
+                    "maybe_freed": merged_maybe_freed
                 }
             elif aid in state_a.alloc_states:
-                merged_allocs[aid] = state_a.alloc_states[aid]
+                st_a = state_a.alloc_states[aid]
+                merged_allocs[aid] = dict(st_a)
+                merged_allocs[aid]["owners"] = set(st_a["owners"])
                 if aid in self.alloc_records:
                     self.alloc_records[aid].is_conditional = True
             else:
-                merged_allocs[aid] = state_b.alloc_states[aid]
+                st_b = state_b.alloc_states[aid]
+                merged_allocs[aid] = dict(st_b)
+                merged_allocs[aid]["owners"] = set(st_b["owners"])
                 if aid in self.alloc_records:
                     self.alloc_records[aid].is_conditional = True
 
@@ -411,11 +442,90 @@ class MemoryAnalyzer:
                 severity=severity
             ))
 
+    def _is_string_literal(self, expr: Any) -> Optional[str]:
+        """Checks if expr is a string literal (direct or wrapped in cast/parenthesis)."""
+        if not isinstance(expr, dict):
+            return None
+        if expr.get("literal_type") == "STRING_LITERAL":
+            return str(expr.get("value", '""'))
+        if expr.get("type") == "LiteralNode" and str(expr.get("value", "")).startswith('"'):
+            return str(expr.get("value", '""'))
+        if expr.get("type") == "UnaryExpressionNode":
+            return self._is_string_literal(expr.get("operand"))
+        return None
+
+    def _extract_pointer_arithmetic(self, expr: Any, state: PathState) -> Optional[Tuple[str, str, str]]:
+        """
+        Checks if expr is pointer arithmetic (e.g. p + 2, 2 + p, p - 1, p + i)
+        derived from a known heap allocation or interior pointer.
+        Returns (base_ptr, alloc_id, display_expr) if found, else None.
+        """
+        if not isinstance(expr, dict):
+            return None
+
+        node_type = expr.get("type")
+        if node_type == "UnaryExpressionNode":
+            return self._extract_pointer_arithmetic(expr.get("operand"), state)
+
+        if node_type == "BinaryExpressionNode":
+            op = expr.get("operator")
+            if op in ("+", "-"):
+                left = expr.get("left")
+                right = expr.get("right")
+
+                def check_ptr(node: Any) -> Optional[Tuple[str, str]]:
+                    if isinstance(node, dict) and node.get("type") == "IdentifierNode":
+                        pname = node.get("name")
+                        val = state.env.get(pname)
+                        if val and val in state.alloc_states:
+                            return (pname, val)
+                        if isinstance(val, str) and val.startswith("interior:"):
+                            parts = val.split(":")
+                            return (pname, parts[1])
+                    return None
+
+                def is_non_zero_offset(node: Any) -> bool:
+                    if not isinstance(node, dict):
+                        return True
+                    val = node.get("value")
+                    return val not in ("0", 0)
+
+                ptr_info = check_ptr(left)
+                if ptr_info and is_non_zero_offset(right):
+                    pname, aid = ptr_info
+                    r_val = right.get("value") if isinstance(right, dict) and "value" in right else (right.get("name") if isinstance(right, dict) else "offset")
+                    return (pname, aid, f"{pname} {op} {r_val}")
+
+                if op == "+":
+                    ptr_info = check_ptr(right)
+                    if ptr_info and is_non_zero_offset(left):
+                        pname, aid = ptr_info
+                        l_val = left.get("value") if isinstance(left, dict) and "value" in left else (left.get("name") if isinstance(left, dict) else "offset")
+                        return (pname, aid, f"{pname} + {l_val}")
+
+        return None
+
+    def _extract_deref_base_name(self, target: str, state: PathState) -> Optional[str]:
+        """Extracts the base pointer variable from a dereference assignment target (e.g. *p, *(p + 1), *q)."""
+        if not isinstance(target, str) or not target.startswith("*"):
+            return None
+        inner = target[1:].strip().strip("()").strip()
+        if inner in state.env:
+            return inner
+        tokens = re.findall(r'[a-zA-Z_]\w*', inner)
+        for t in tokens:
+            if t in state.env:
+                return t
+        return tokens[0] if tokens else None
+
     def _report_uaf_if_freed(self, ptr_name: str, line: int, state: PathState):
         """Reports a USE AFTER FREE issue if ptr_name points to an allocation that has been freed."""
         if not ptr_name:
             return
         alloc_id = state.env.get(ptr_name)
+        if isinstance(alloc_id, str) and alloc_id.startswith("interior:"):
+            parts = alloc_id.split(":")
+            alloc_id = parts[1]
         if alloc_id and alloc_id in state.alloc_states:
             st = state.alloc_states[alloc_id]
             if st["freed"]:
@@ -431,20 +541,25 @@ class MemoryAnalyzer:
                 )
 
     def _check_use_after_free(self, expr: Any, line: int, state: PathState):
-        """Recursively checks expressions for dereferences (*ptr or ptr[idx]) of freed memory."""
+        """Recursively checks expressions for dereferences (*ptr, *(p+1), ptr[idx], node->field) of freed memory."""
         if not isinstance(expr, dict):
             return
 
         node_type = expr.get("type")
 
-        # Case 1: Unary dereference: *p
+        # Case 1: Unary dereference: *p or *(p + 1)
         if node_type == "UnaryExpressionNode" and expr.get("operator") == "*":
             operand = expr.get("operand")
             if isinstance(operand, dict) and operand.get("type") == "IdentifierNode":
                 ptr_name = operand.get("name")
                 self._report_uaf_if_freed(ptr_name, line, state)
             elif isinstance(operand, dict):
-                self._check_use_after_free(operand, line, state)
+                arith = self._extract_pointer_arithmetic(operand, state)
+                if arith:
+                    base_ptr, _, _ = arith
+                    self._report_uaf_if_freed(base_ptr, line, state)
+                else:
+                    self._check_use_after_free(operand, line, state)
             return
 
         # Case 2: Array index dereference: p[idx]
@@ -458,14 +573,31 @@ class MemoryAnalyzer:
             self._check_use_after_free(expr.get("right"), line, state)
             return
 
-        # Case 3: Other unary / binary / call expressions
+        # Case 3: Arrow operator member dereference: node->field
+        if node_type == "BinaryExpressionNode" and expr.get("operator") == "->":
+            left = expr.get("left")
+            if isinstance(left, dict) and left.get("type") == "IdentifierNode":
+                ptr_name = left.get("name")
+                self._report_uaf_if_freed(ptr_name, line, state)
+            elif isinstance(left, dict):
+                self._check_use_after_free(left, line, state)
+            self._check_use_after_free(expr.get("right"), line, state)
+            return
+
+        # Case 4: Other unary / binary / call expressions
         if node_type == "UnaryExpressionNode":
             self._check_use_after_free(expr.get("operand"), line, state)
         elif node_type == "BinaryExpressionNode":
             self._check_use_after_free(expr.get("left"), line, state)
             self._check_use_after_free(expr.get("right"), line, state)
         elif node_type == "FunctionCallNode":
-            for arg in expr.get("args", []):
+            fn_name = expr.get("name")
+            args = expr.get("args", [])
+            # Built-in functions that unconditionally dereference pointer argument
+            if fn_name in ("puts", "strlen", "fputs"):
+                if args and isinstance(args[0], dict) and args[0].get("type") == "IdentifierNode":
+                    self._report_uaf_if_freed(args[0].get("name"), line, state)
+            for arg in args:
                 self._check_use_after_free(arg, line, state)
 
     def _handle_pointer_assignment(self, target: str, expr: Any, line: int, state: PathState):
@@ -508,16 +640,36 @@ class MemoryAnalyzer:
             state.env[target] = inst.alloc_id
             return
 
-        # Case B: Assignment to stack address e.g. target = &local_var
+        # Case B: Assignment to string literal e.g. target = "literal"
+        str_lit = self._is_string_literal(expr)
+        if str_lit:
+            self._check_and_orphan(target, state)
+            state.env[target] = "string_literal"
+            return
+
+        # Case C: Assignment to pointer arithmetic e.g. target = p + 2 (interior pointer)
+        ptr_arith = self._extract_pointer_arithmetic(expr, state)
+        if ptr_arith:
+            base_ptr, aid, _ = ptr_arith
+            self._check_and_orphan(target, state)
+            state.env[target] = f"interior:{aid}:{base_ptr}"
+            return
+
+        # Case D: Assignment to address-of variable e.g. target = &local_var or &global_var
         if isinstance(expr, dict) and expr.get("type") == "UnaryExpressionNode" and expr.get("operator") == "&":
             operand = expr.get("operand")
             if isinstance(operand, dict) and operand.get("type") == "IdentifierNode":
                 var_name = operand.get("name")
                 self._check_and_orphan(target, state)
-                state.env[target] = f"stack:{var_name}"
+                if self._is_local_var(var_name, state):
+                    state.env[target] = f"stack:{var_name}"
+                elif var_name in self.global_vars:
+                    state.env[target] = f"global:{var_name}"
+                else:
+                    state.env[target] = f"stack:{var_name}"
                 return
 
-        # Case C: Assignment to NULL or 0 (lost pointer leak if target was sole owner)
+        # Case E: Assignment to NULL or 0 (lost pointer leak if target was sole owner)
         if isinstance(expr, dict) and (
             expr.get("value") in ("NULL", "0") or
             expr.get("name") == "NULL"
@@ -526,7 +678,7 @@ class MemoryAnalyzer:
             state.env[target] = None
             return
 
-        # Case D: Assignment to another pointer variable (aliasing)
+        # Case F: Assignment to another pointer variable (aliasing)
         if isinstance(expr, dict) and expr.get("type") == "IdentifierNode":
             src_var = expr.get("name")
             if src_var in state.env:
@@ -550,45 +702,92 @@ class MemoryAnalyzer:
         if not isinstance(arg0, dict):
             return
 
-        # Case 1: Direct free(&var) of stack address
+        # Case 1: Direct free(&var) of stack or global address
         if arg0.get("type") == "UnaryExpressionNode" and arg0.get("operator") == "&":
             operand = arg0.get("operand")
-            var_name = operand.get("name") if isinstance(operand, dict) else "stack_var"
-            self._add_extra_issue(f"&{var_name}", "None", 0, True, line, "INVALID FREE", "error")
+            var_name = operand.get("name") if isinstance(operand, dict) else "var"
+            if self._is_local_var(var_name, state):
+                fn_kind = "stack"
+            elif var_name in self.global_vars:
+                fn_kind = "global"
+            else:
+                fn_kind = "stack"
+            self._add_extra_issue(f"&{var_name}", fn_kind, 0, True, line, "INVALID FREE", "error")
+            return
+
+        # Case 2: Direct free("literal") of string literal
+        str_lit = self._is_string_literal(arg0)
+        if str_lit:
+            self._add_extra_issue(str_lit, "string_literal", 0, True, line, "INVALID FREE", "error")
+            return
+
+        # Case 3: Direct free(p + 2) of pointer arithmetic expression
+        arith_info = self._extract_pointer_arithmetic(arg0, state)
+        if arith_info:
+            _, _, disp = arith_info
+            self._add_extra_issue(disp, "interior", 0, True, line, "INVALID FREE", "error")
             return
 
         freed_ptr = arg0.get("name")
         if not freed_ptr:
             return
 
-        # Case 2: free(NULL) or freeing pointer explicitly set to NULL
+        # Case 4: free(NULL) or freeing pointer explicitly set to NULL
         if freed_ptr == "NULL" or (freed_ptr in state.env and state.env.get(freed_ptr) in (None, "NULL")):
             # Standard C defines free(NULL) as a valid no-op
             return
 
-        # Case 3: Freeing pointer holding stack address: p = &x; free(p);
+        # Case 5: Freeing pointer holding string literal: s = "text"; free(s);
         ptr_val = state.env.get(freed_ptr)
-        if isinstance(ptr_val, str) and ptr_val.startswith("stack:"):
-            self._add_extra_issue(freed_ptr, "stack", 0, True, line, "INVALID FREE", "error")
+        if ptr_val == "string_literal":
+            self._add_extra_issue(freed_ptr, "string_literal", 0, True, line, "INVALID FREE", "error")
             return
 
-        # Case 4: Known heap allocation on this path
+        # Case 6: Freeing interior pointer: q = p + 2; free(q);
+        if isinstance(ptr_val, str) and ptr_val.startswith("interior:"):
+            self._add_extra_issue(freed_ptr, "interior", 0, True, line, "INVALID FREE", "error")
+            return
+
+        # Case 7: Freeing pointer holding stack or global address: p = &x; free(p);
+        if isinstance(ptr_val, str) and (ptr_val.startswith("stack:") or ptr_val.startswith("global:")):
+            fn_kind = "global" if ptr_val.startswith("global:") else "stack"
+            self._add_extra_issue(freed_ptr, fn_kind, 0, True, line, "INVALID FREE", "error")
+            return
+
+        # Case 8: Known heap allocation on this path
         alloc_id = state.env.get(freed_ptr)
         if alloc_id and alloc_id in state.alloc_states:
             st = state.alloc_states[alloc_id]
             if not st["freed"]:
-                st["freed"] = True
-                st["free_line"] = line
-                st["owners"].discard(freed_ptr)
+                if st.get("maybe_freed", False):
+                    # Possible double-free: allocation may have already been freed along an alternate control-flow path
+                    alloc = self.alloc_records.get(alloc_id)
+                    self._add_extra_issue(
+                        freed_ptr,
+                        alloc.allocation_function if alloc else "malloc",
+                        alloc.allocation_line if alloc else 0,
+                        True,
+                        line,
+                        "POSSIBLE DOUBLE FREE",
+                        "warning"
+                    )
+                    st["freed"] = True
+                    st["maybe_freed"] = False
+                    st["free_line"] = line
+                    st["owners"].discard(freed_ptr)
+                else:
+                    st["freed"] = True
+                    st["free_line"] = line
+                    st["owners"].discard(freed_ptr)
 
-                if alloc_id in self.alloc_records:
-                    alloc = self.alloc_records[alloc_id]
-                    alloc.freed = True
-                    alloc.free_line = line
-                    alloc.status = "SAFE"
-                    alloc.severity = "safe"
+                    if alloc_id in self.alloc_records:
+                        alloc = self.alloc_records[alloc_id]
+                        alloc.freed = True
+                        alloc.free_line = line
+                        alloc.status = "SAFE"
+                        alloc.severity = "safe"
             else:
-                # Double Free! (either direct free(p) or through alias free(q))
+                # Definite double-free! (either direct free(p) or through alias free(q))
                 alloc = self.alloc_records.get(alloc_id)
                 self._add_extra_issue(
                     freed_ptr,
@@ -600,7 +799,7 @@ class MemoryAnalyzer:
                     "error"
                 )
         else:
-            # Case 5: Pointer not bound to any known heap allocation on this path
+            # Case 9: Pointer not bound to any known heap allocation on this path
             if freed_ptr in self.fn_params:
                 return
 
@@ -612,6 +811,8 @@ class MemoryAnalyzer:
             )
             if prev_st and prev_st["freed"]:
                 self._add_extra_issue(freed_ptr, "malloc", 0, True, line, "DOUBLE FREE", "error")
+            elif prev_st and prev_st.get("maybe_freed", False):
+                self._add_extra_issue(freed_ptr, "malloc", 0, True, line, "POSSIBLE DOUBLE FREE", "warning")
             else:
                 self._add_extra_issue(freed_ptr, "None", 0, True, line, "INVALID FREE", "error")
 
@@ -826,6 +1027,7 @@ class MemoryAnalyzer:
             prev_params = self.fn_params
             self.fn_params = set(node.get("params", []))
             fn_state = PathState()
+            fn_state.scopes = [set(self.fn_params)]
             body = node.get("body", {})
             self._walk_node(body, fn_state)
             if not fn_state.returned:
@@ -833,12 +1035,14 @@ class MemoryAnalyzer:
             self.fn_params = prev_params
 
         elif node_type == "BlockNode":
+            state.scopes.append(set())
             block_vars: Set[str] = set()
             for stmt in node.get("statements", []):
                 if isinstance(stmt, dict) and stmt.get("type") == "DeclarationNode":
                     var_name = stmt.get("name")
                     if var_name:
                         block_vars.add(var_name)
+                        state.scopes[-1].add(var_name)
 
             self._walk_statements(node.get("statements", []), state)
 
@@ -847,10 +1051,15 @@ class MemoryAnalyzer:
                 self._check_and_orphan(var, state)
                 state.env.pop(var, None)
 
+            if len(state.scopes) > 1:
+                state.scopes.pop()
+
         elif node_type == "DeclarationNode":
             var_name = node.get("name")
             init_expr = node.get("initializer")
             line = node.get("line", 1)
+            if state.scopes and var_name:
+                state.scopes[-1].add(var_name)
             if init_expr:
                 self._check_use_after_free(init_expr, line, state)
                 self._handle_pointer_assignment(var_name, init_expr, line, state)
@@ -862,10 +1071,19 @@ class MemoryAnalyzer:
             val_expr = node.get("value")
             line = node.get("line", 1)
 
-            # Check if LHS is a dereference: *p = 10
+            # Check if LHS is a dereference: *p = 10, *(p + 1) = 42, node->next = NULL, or p[0] = 10
             if isinstance(target, str) and target.startswith("*"):
-                ptr_name = target[1:].strip()
-                self._report_uaf_if_freed(ptr_name, line, state)
+                base_ptr = self._extract_deref_base_name(target, state)
+                if base_ptr:
+                    self._report_uaf_if_freed(base_ptr, line, state)
+            elif isinstance(target, str) and "->" in target:
+                base_ptr = target.split("->")[0].strip()
+                if base_ptr:
+                    self._report_uaf_if_freed(base_ptr, line, state)
+            elif isinstance(target, str) and "[" in target:
+                base_ptr = target.split("[")[0].strip()
+                if base_ptr:
+                    self._report_uaf_if_freed(base_ptr, line, state)
             else:
                 self._handle_pointer_assignment(target, val_expr, line, state)
 
@@ -882,8 +1100,7 @@ class MemoryAnalyzer:
             if fn_name == "free":
                 self._handle_free_call(args, line, state)
             else:
-                for arg in args:
-                    self._check_use_after_free(arg, line, state)
+                self._check_use_after_free(node, line, state)
 
         elif node_type == "ReturnNode":
             val_expr = node.get("value")
