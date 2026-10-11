@@ -45,12 +45,21 @@ class SymbolTableBuilder:
             # Track brace depth for scope management
             if tok.lexeme == "{":
                 scope_depth += 1
+                if scope_depth > 1 and current_scope != "Global":
+                    base_fn = current_scope.split(" (Block")[0]
+                    current_scope = f"{base_fn} (Block {scope_depth})"
                 i += 1
                 continue
             elif tok.lexeme == "}":
                 scope_depth = max(0, scope_depth - 1)
                 if scope_depth == 0:
                     current_scope = "Global"
+                elif scope_depth == 1 and current_scope != "Global":
+                    base_fn = current_scope.split(" (Block")[0]
+                    current_scope = base_fn
+                elif scope_depth > 1 and current_scope != "Global":
+                    base_fn = current_scope.split(" (Block")[0]
+                    current_scope = f"{base_fn} (Block {scope_depth})"
                 i += 1
                 continue
 

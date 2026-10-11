@@ -2883,6 +2883,286 @@ int main() {
         self.assertIsNone(suggs_pos[0].safe_fix)
 
 
+class TestPhase3CControlFlowLoopsAndScopes(unittest.TestCase):
+    """
+    Phase 3C Regression Test Suite:
+    Control-Flow Analysis, Loops, Variable Scopes and Memory State Transitions.
+    """
+
+    def test_nested_branches_safe_cleanup(self):
+        """Phase 3C: Nested if/else branches where memory is cleaned up on all execution paths is SAFE."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int test(int c1, int c2) {
+    int *p = malloc(16);
+    if (c1) {
+        if (c2) {
+            free(p);
+        } else {
+            free(p);
+        }
+    } else {
+        free(p);
+    }
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.memory_analysis), 1)
+        self.assertEqual(res.memory_analysis[0].status, "SAFE")
+        self.assertEqual(res.memory_analysis[0].severity, "safe")
+        self.assertTrue(res.memory_analysis[0].freed)
+
+    def test_nested_branches_conditional_leak_no_safefix(self):
+        """Phase 3C: Nested if/else branch with missing cleanup reports POSSIBLE LEAK without automatic safe-fix."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int test(int c1, int c2) {
+    int *p = malloc(16);
+    if (c1) {
+        if (c2) {
+            free(p);
+        }
+    } else {
+        free(p);
+    }
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.memory_analysis), 1)
+        self.assertEqual(res.memory_analysis[0].status, "POSSIBLE LEAK")
+        self.assertEqual(res.memory_analysis[0].severity, "warning")
+        suggs = [s for s in res.suggestions if s.category == "MEMORY"]
+        for s in suggs:
+            self.assertIsNone(s.safe_fix, "Possible leaks must never receive automatic fixes")
+
+    def test_early_return_before_allocation(self):
+        """Phase 3C: Early return before allocation does not create spurious leaks or warnings."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int test(int err) {
+    if (err) return -1;
+    int *p = malloc(16);
+    free(p);
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.memory_analysis), 1)
+        self.assertEqual(res.memory_analysis[0].status, "SAFE")
+        self.assertEqual(res.memory_analysis[0].severity, "safe")
+
+    def test_early_return_after_allocation_reports_possible_leak(self):
+        """Phase 3C: Early return after allocation without cleanup reports POSSIBLE LEAK and denies safe-fix."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int test(int err) {
+    int *p = malloc(16);
+    if (err) return -1;
+    free(p);
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.memory_analysis), 1)
+        self.assertEqual(res.memory_analysis[0].status, "POSSIBLE LEAK")
+        self.assertEqual(res.memory_analysis[0].severity, "warning")
+        suggs = [s for s in res.suggestions if s.category == "MEMORY"]
+        for s in suggs:
+            self.assertIsNone(s.safe_fix, "Early return leak must not receive automated fix changing semantics")
+
+    def test_for_and_while_loop_alloc_and_free_each_iteration(self):
+        """Phase 3C: Heap allocation and deallocation within each iteration of for/while loops is SAFE."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code_for = """int test(int n) {
+    for (int i = 0; i < n; i++) {
+        int *p = malloc(16);
+        free(p);
+    }
+    return 0;
+}"""
+        res_for = analyze_code(AnalyzeRequest(code=code_for))
+        self.assertEqual(len(res_for.memory_analysis), 1)
+        self.assertEqual(res_for.memory_analysis[0].status, "SAFE")
+        self.assertEqual(res_for.memory_analysis[0].severity, "safe")
+
+        code_while = """int test(int cond) {
+    while (cond) {
+        int *q = malloc(32);
+        free(q);
+    }
+    return 0;
+}"""
+        res_while = analyze_code(AnalyzeRequest(code=code_while))
+        self.assertEqual(len(res_while.memory_analysis), 1)
+        self.assertEqual(res_while.memory_analysis[0].status, "SAFE")
+        self.assertEqual(res_while.memory_analysis[0].severity, "safe")
+
+    def test_zero_iteration_loops_handling(self):
+        """Phase 3C: while(0) executes 0 times (safe post-free), do-while(0) executes once (post-free double-free)."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        # while (0) body skipped: single free outside loop is safe
+        code_while0 = """int test() {
+    int *p = malloc(16);
+    while (0) {
+        free(p);
+    }
+    free(p);
+    return 0;
+}"""
+        res_w0 = analyze_code(AnalyzeRequest(code=code_while0))
+        dfs_w0 = [a for a in res_w0.anomalies if a.issue_type in ("DOUBLE FREE", "POSSIBLE DOUBLE FREE")]
+        self.assertEqual(len(dfs_w0), 0)
+        self.assertEqual(res_w0.memory_analysis[0].status, "SAFE")
+
+        # do-while (0) body executes 1st iteration: post-loop free is definite double free
+        code_dowhile0 = """int test() {
+    int *p = malloc(16);
+    do {
+        free(p);
+    } while (0);
+    free(p);
+    return 0;
+}"""
+        res_dw0 = analyze_code(AnalyzeRequest(code=code_dowhile0))
+        dfs_dw0 = [a for a in res_dw0.anomalies if a.issue_type == "DOUBLE FREE"]
+        self.assertEqual(len(dfs_dw0), 1)
+        self.assertEqual(dfs_dw0[0].severity, "error")
+
+    def test_loop_repeated_allocation_leak(self):
+        """Phase 3C: Repeated heap allocation in loop without freeing leaks previous iterations."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int test(int n) {
+    int *p = NULL;
+    for (int i = 0; i < n; i++) {
+        p = malloc(16);
+    }
+    free(p);
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertTrue(any(m.status == "POSSIBLE LEAK" for m in res.memory_analysis))
+
+    def test_loop_break_and_continue_cleanup_paths(self):
+        """Phase 3C: Break without cleanup causes leak warning; continue with cleanup remains SAFE."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code_break = """int test(int cond, int err) {
+    while (cond) {
+        int *p = malloc(16);
+        if (err) break;
+        free(p);
+    }
+    return 0;
+}"""
+        res_b = analyze_code(AnalyzeRequest(code=code_break))
+        self.assertEqual(res_b.memory_analysis[0].status, "POSSIBLE LEAK")
+
+        code_continue = """int test(int cond, int flag) {
+    while (cond) {
+        int *p = malloc(16);
+        if (flag) {
+            free(p);
+            continue;
+        }
+        free(p);
+    }
+    return 0;
+}"""
+        res_c = analyze_code(AnalyzeRequest(code=code_continue))
+        self.assertEqual(res_c.memory_analysis[0].status, "SAFE")
+
+    def test_nested_loops_memory_operations(self):
+        """Phase 3C: Inner and outer nested loops manage heap memory cleanly per iteration."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int test(int rows, int cols) {
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            int *buf = malloc(64);
+            free(buf);
+        }
+    }
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertEqual(len(res.memory_analysis), 1)
+        self.assertEqual(res.memory_analysis[0].status, "SAFE")
+
+    def test_variable_shadowing_nested_block_scopes(self):
+        """Phase 3C: Local variable shadowing in nested block scopes isolates lifetimes and prevents false leaks."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        # Clean outer and inner allocations
+        code_clean = """int test() {
+    int *p = malloc(16);
+    {
+        int *p = malloc(32);
+        free(p);
+    }
+    free(p);
+    return 0;
+}"""
+        res_clean = analyze_code(AnalyzeRequest(code=code_clean))
+        self.assertEqual(len(res_clean.memory_analysis), 2)
+        self.assertTrue(all(m.status == "SAFE" for m in res_clean.memory_analysis))
+
+        # Un-freed inner allocation leaks on block exit while outer is safely freed
+        code_inner_leak = """int test() {
+    int *p = malloc(16);
+    {
+        int *p = malloc(32);
+    }
+    free(p);
+    return 0;
+}"""
+        res_leak = analyze_code(AnalyzeRequest(code=code_inner_leak))
+        self.assertEqual(len(res_leak.memory_analysis), 2)
+        statuses = [m.status for m in res_leak.memory_analysis]
+        self.assertIn("SAFE", statuses)
+        self.assertTrue(any("LEAK" in s for s in statuses))
+
+        # Symbol table accepts block shadowing without false redeclaration error
+        code_sym = """int test() {
+    int x = 1;
+    {
+        int x = 2;
+    }
+    return 0;
+}"""
+        res_sym = analyze_code(AnalyzeRequest(code=code_sym))
+        self.assertEqual(len(res_sym.anomalies), 0)
+
+    def test_use_after_free_after_loop(self):
+        """Phase 3C: Pointer freed inside loop body dereferenced after loop is detected as USE AFTER FREE."""
+        from main import analyze_code
+        from models import AnalyzeRequest
+
+        code = """int test(int cond) {
+    int *p = malloc(16);
+    while (1) {
+        free(p);
+        break;
+    }
+    *p = 42;
+    return 0;
+}"""
+        res = analyze_code(AnalyzeRequest(code=code))
+        uaf = [a for a in res.anomalies if a.issue_type == "USE AFTER FREE"]
+        self.assertEqual(len(uaf), 1)
+        self.assertEqual(uaf[0].severity, "error")
+
+
 if __name__ == "__main__":
     unittest.main()
 

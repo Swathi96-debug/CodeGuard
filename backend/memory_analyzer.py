@@ -30,6 +30,7 @@ class PathState:
         # alloc_id -> dict with keys: freed, free_line, escaped, owners, was_reallocated, realloc_from, leaked
         self.alloc_states: Dict[str, Dict[str, Any]] = {}
         self.scopes: List[Set[str]] = [set()]
+        self.shadowed_bindings: List[Dict[str, Optional[str]]] = []
         self.returned: bool = False
         self.return_line: Optional[int] = None
         self.broken: bool = False
@@ -53,6 +54,7 @@ class PathState:
             for aid, st in self.alloc_states.items()
         }
         cp.scopes = [set(s) for s in self.scopes]
+        cp.shadowed_bindings = [dict(b) for b in self.shadowed_bindings]
         cp.returned = self.returned
         cp.return_line = self.return_line
         cp.broken = self.broken
@@ -241,6 +243,7 @@ class MemoryAnalyzer:
             for aid, st in src.alloc_states.items()
         }
         dest.scopes = [set(s) for s in src.scopes]
+        dest.shadowed_bindings = [dict(b) for b in src.shadowed_bindings]
         dest.returned = src.returned
         dest.return_line = src.return_line
         dest.broken = src.broken
@@ -262,7 +265,8 @@ class MemoryAnalyzer:
             if val_a == val_b:
                 merged_env[v] = val_a
             else:
-                merged_env[v] = val_a or val_b
+                chosen = val_a or val_b
+                merged_env[v] = f"maybe:{chosen}" if chosen else None
         state_out.env = merged_env
 
         # 2. Merge allocation states
@@ -409,6 +413,8 @@ class MemoryAnalyzer:
     def _check_and_orphan(self, ptr_name: str, state: PathState):
         """Removes ptr_name from its previous allocation's owner set and flags a leak if orphaned."""
         old_alloc_id = state.env.get(ptr_name)
+        if isinstance(old_alloc_id, str) and old_alloc_id.startswith("maybe:"):
+            old_alloc_id = old_alloc_id.split(":", 1)[1]
         if old_alloc_id and old_alloc_id in state.alloc_states:
             st = state.alloc_states[old_alloc_id]
             st["owners"].discard(ptr_name)
@@ -416,6 +422,7 @@ class MemoryAnalyzer:
                 st["leaked"] = True
                 if old_alloc_id in self.alloc_records:
                     alloc = self.alloc_records[old_alloc_id]
+                    alloc.path_outcomes.append("LEAK")
                     if alloc.was_reallocated or self.in_conditional_depth > 0 or self.in_loop_depth > 0:
                         alloc.status = "POSSIBLE LEAK"
                         alloc.severity = "warning"
@@ -523,6 +530,8 @@ class MemoryAnalyzer:
         if not ptr_name:
             return
         alloc_id = state.env.get(ptr_name)
+        if isinstance(alloc_id, str) and alloc_id.startswith("maybe:"):
+            alloc_id = alloc_id.split(":", 1)[1]
         if isinstance(alloc_id, str) and alloc_id.startswith("interior:"):
             parts = alloc_id.split(":")
             alloc_id = parts[1]
@@ -755,11 +764,22 @@ class MemoryAnalyzer:
             return
 
         # Case 8: Known heap allocation on this path
-        alloc_id = state.env.get(freed_ptr)
+        raw_alloc_id = state.env.get(freed_ptr)
+        is_maybe = isinstance(raw_alloc_id, str) and raw_alloc_id.startswith("maybe:")
+        alloc_id = raw_alloc_id.split(":", 1)[1] if is_maybe else raw_alloc_id
+
         if alloc_id and alloc_id in state.alloc_states:
             st = state.alloc_states[alloc_id]
             if not st["freed"]:
-                if st.get("maybe_freed", False):
+                if is_maybe:
+                    st["maybe_freed"] = True
+                    alloc = self.alloc_records.get(alloc_id)
+                    if alloc:
+                        alloc.is_conditional = True
+                        alloc.status = "POSSIBLE LEAK"
+                        alloc.severity = "warning"
+                    st["owners"].discard(freed_ptr)
+                elif st.get("maybe_freed", False):
                     # Possible double-free: allocation may have already been freed along an alternate control-flow path
                     alloc = self.alloc_records.get(alloc_id)
                     self._add_extra_issue(
@@ -787,7 +807,7 @@ class MemoryAnalyzer:
                         alloc.status = "SAFE"
                         alloc.severity = "safe"
             else:
-                # Definite double-free! (either direct free(p) or through alias free(q))
+                # Double-free (definite, or possible if freed via a conditional alias)
                 alloc = self.alloc_records.get(alloc_id)
                 self._add_extra_issue(
                     freed_ptr,
@@ -795,8 +815,8 @@ class MemoryAnalyzer:
                     alloc.allocation_line if alloc else 0,
                     True,
                     line,
-                    "DOUBLE FREE",
-                    "error"
+                    "POSSIBLE DOUBLE FREE" if is_maybe else "DOUBLE FREE",
+                    "warning" if is_maybe else "error"
                 )
         else:
             # Case 9: Pointer not bound to any known heap allocation on this path
@@ -877,11 +897,16 @@ class MemoryAnalyzer:
             if op == "!=":
                 # On else branch: var_name is NULL (failed allocation), so no heap buffer exists on this path
                 aid = state_else.env.get(var_name)
+                if isinstance(aid, str) and aid.startswith("maybe:"):
+                    aid = aid.split(":", 1)[1]
                 state_else.env[var_name] = None
                 if aid and aid in state_else.alloc_states:
                     del state_else.alloc_states[aid]
                 # On then branch: var_name is non-NULL (realloc succeeded)
                 aid_then = state_then.env.get(var_name)
+                if isinstance(aid_then, str) and aid_then.startswith("maybe:"):
+                    aid_then = aid_then.split(":", 1)[1]
+                    state_then.env[var_name] = aid_then
                 if aid_then and aid_then in self.alloc_records:
                     realloc_src = self.alloc_records[aid_then].realloc_from
                     if realloc_src:
@@ -891,11 +916,16 @@ class MemoryAnalyzer:
             elif op == "==":
                 # On then branch: var_name is NULL (failed allocation)
                 aid = state_then.env.get(var_name)
+                if isinstance(aid, str) and aid.startswith("maybe:"):
+                    aid = aid.split(":", 1)[1]
                 state_then.env[var_name] = None
                 if aid and aid in state_then.alloc_states:
                     del state_then.alloc_states[aid]
                 # On else branch: var_name is non-NULL (realloc succeeded)
                 aid_else = state_else.env.get(var_name)
+                if isinstance(aid_else, str) and aid_else.startswith("maybe:"):
+                    aid_else = aid_else.split(":", 1)[1]
+                    state_else.env[var_name] = aid_else
                 if aid_else and aid_else in self.alloc_records:
                     realloc_src = self.alloc_records[aid_else].realloc_from
                     if realloc_src:
@@ -968,6 +998,35 @@ class MemoryAnalyzer:
         body = node.get("body")
         increment = node.get("increment") if node_type == "ForNode" else None
 
+        if node_type == "DoWhileNode":
+            # Do-while loop executes body unconditionally on the first iteration
+            self.in_loop_depth += 1
+            if body:
+                self._walk_node(body, state)
+            if cond:
+                self._check_use_after_free(cond, line, state)
+            self.in_loop_depth -= 1
+
+            if state.broken:
+                state.broken = False
+                return
+            if state.returned:
+                return
+
+            # If condition is known false (e.g. while (0)), it terminates immediately
+            if cond_const is False:
+                return
+
+            # Simulate second iteration for loop-carried issues (repeated alloc, double free, UAF)
+            state_2 = state.clone()
+            self.in_loop_depth += 1
+            self.simulating_loop_carried = True
+            if body:
+                self._walk_node(body, state_2)
+            self.simulating_loop_carried = False
+            self.in_loop_depth -= 1
+            return
+
         if cond_const is True:
             # Loop definitely executes
             self.in_loop_depth += 1
@@ -1036,30 +1095,37 @@ class MemoryAnalyzer:
 
         elif node_type == "BlockNode":
             state.scopes.append(set())
-            block_vars: Set[str] = set()
-            for stmt in node.get("statements", []):
-                if isinstance(stmt, dict) and stmt.get("type") == "DeclarationNode":
-                    var_name = stmt.get("name")
-                    if var_name:
-                        block_vars.add(var_name)
-                        state.scopes[-1].add(var_name)
+            state.shadowed_bindings.append({})
 
             self._walk_statements(node.get("statements", []), state)
 
             # Scope exit for block-scoped variables:
-            for var in block_vars:
-                self._check_and_orphan(var, state)
-                state.env.pop(var, None)
+            saved = state.shadowed_bindings.pop() if state.shadowed_bindings else {}
+            current_scope_vars = state.scopes.pop() if len(state.scopes) > 1 else set()
 
-            if len(state.scopes) > 1:
-                state.scopes.pop()
+            for var in current_scope_vars:
+                self._check_and_orphan(var, state)
+                if var in saved:
+                    outer_val = saved[var]
+                    state.env[var] = outer_val
+                    if outer_val and outer_val in state.alloc_states:
+                        state.alloc_states[outer_val]["owners"].add(var)
+                else:
+                    state.env.pop(var, None)
 
         elif node_type == "DeclarationNode":
             var_name = node.get("name")
             init_expr = node.get("initializer")
             line = node.get("line", 1)
+            is_shadowing = False
+            if state.shadowed_bindings and var_name in state.env:
+                if var_name not in state.shadowed_bindings[-1]:
+                    state.shadowed_bindings[-1][var_name] = state.env[var_name]
+                    is_shadowing = True
             if state.scopes and var_name:
                 state.scopes[-1].add(var_name)
+            if is_shadowing:
+                state.env[var_name] = None
             if init_expr:
                 self._check_use_after_free(init_expr, line, state)
                 self._handle_pointer_assignment(var_name, init_expr, line, state)
