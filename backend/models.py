@@ -39,7 +39,7 @@ class MemoryAllocation(BaseModel):
     allocation_line: int
     freed: bool
     free_line: Optional[int] = None
-    status: str  # SAFE, POSSIBLE LEAK, DOUBLE FREE, INVALID FREE
+    status: str  # SAFE, ESCAPED, POSSIBLE LEAK, DEFINITE LEAK, DOUBLE FREE, INVALID FREE, USE AFTER FREE
     severity: str  # safe, warning, error
 
 class DuplicateBlock(BaseModel):
@@ -69,6 +69,11 @@ class SuggestionItem(BaseModel):
     line: int
     safe_fix: Optional[str] = None
     category: str
+    original_snippet: Optional[str] = None
+    fixed_snippet: Optional[str] = None
+    fix_explanation: Optional[str] = None
+    fix_type: Optional[str] = None  # "replace", "insert", "none"
+    target_line: Optional[int] = None
 
 class TokenStats(BaseModel):
     keywords: int = 0

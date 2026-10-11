@@ -1,7 +1,14 @@
 import React from 'react';
-import { Lightbulb, Wrench, CheckCircle2 } from 'lucide-react';
+import { Lightbulb, Wrench, CheckCircle2, Eye, Info, AlertTriangle } from 'lucide-react';
 
-export default function SuggestionsTab({ suggestions, onSelectLine, onApplyFix }) {
+export default function SuggestionsTab({ suggestions, currentCode, analyzedCode, onSelectLine, onPreviewFix }) {
+  const normalize = (s) => (s || '').replace(/\r\n/g, '\n');
+  const isSourceDrifted = Boolean(
+    analyzedCode &&
+    currentCode !== undefined &&
+    normalize(currentCode) !== normalize(analyzedCode)
+  );
+
   return (
     <div>
       <div className="tab-toolbar" style={{ marginBottom: '16px' }}>
@@ -9,10 +16,29 @@ export default function SuggestionsTab({ suggestions, onSelectLine, onApplyFix }
           <Lightbulb size={18} color="var(--status-warning)" />
           <h3 style={{ fontSize: '14px', fontWeight: 600 }}>Rule-Based Suggestion Engine</h3>
         </div>
-        <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
-          {suggestions?.length || 0} Actionable Fixes
-        </span>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          {isSourceDrifted && (
+            <span className="badge badge-error">SOURCE MODIFIED</span>
+          )}
+          <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+            {suggestions?.length || 0} Actionable Items
+          </span>
+        </div>
       </div>
+
+      {isSourceDrifted && (
+        <div className="invalidation-banner" style={{ marginBottom: '16px' }}>
+          <AlertTriangle size={16} color="var(--status-error)" style={{ flexShrink: 0 }} />
+          <div>
+            <strong style={{ color: 'var(--status-error)', fontSize: '12px' }}>
+              Source code has changed since last analysis
+            </strong>
+            <p style={{ fontSize: '11px', color: 'var(--text-secondary)', marginTop: '2px' }}>
+              The suggestions below were generated for an earlier version of your code. Click <strong>Analyze</strong> to refresh suggestions.
+            </p>
+          </div>
+        </div>
+      )}
 
       {!suggestions || suggestions.length === 0 ? (
         <div className="card-item" style={{ textAlign: 'center', padding: '24px', borderColor: 'var(--status-safe)' }}>
@@ -27,7 +53,9 @@ export default function SuggestionsTab({ suggestions, onSelectLine, onApplyFix }
           <div key={sugg.id} className="card-item">
             <div className="card-item-header">
               <span className="card-item-title">{sugg.title} (Line {sugg.line})</span>
-              <span className="badge badge-info">{sugg.category}</span>
+              <span className={`badge ${sugg.safe_fix ? 'badge-safe' : 'badge-info'}`}>
+                {sugg.safe_fix ? 'SAFE FIX AVAILABLE' : sugg.category}
+              </span>
             </div>
 
             <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '8px' }}>
@@ -38,23 +66,32 @@ export default function SuggestionsTab({ suggestions, onSelectLine, onApplyFix }
               <strong>Recommended Action:</strong> {sugg.suggestion}
             </div>
 
-            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
               <button 
                 className="btn-action" 
                 onClick={() => onSelectLine(sugg.line)}
+                title={`Jump to line ${sugg.line} in code editor`}
               >
+                <Eye size={13} />
                 View in Editor (Line {sugg.line})
               </button>
 
-              {sugg.safe_fix && (
+              {sugg.safe_fix ? (
                 <button 
                   className="btn-action btn-primary"
-                  onClick={() => onApplyFix(sugg)}
+                  onClick={() => onPreviewFix(sugg)}
                   style={{ gap: '6px' }}
+                  title="Review diff and confirm fix before applying"
+                  id={`btn-review-fix-${sugg.id}`}
                 >
                   <Wrench size={13} />
-                  Apply Safe Fix
+                  Review & Apply Fix
                 </button>
+              ) : (
+                <div style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                  <Info size={12} />
+                  <span>Manual review recommended (safe automated fix unavailable)</span>
+                </div>
               )}
             </div>
           </div>

@@ -22,6 +22,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def add_no_cache_header(request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import os
@@ -34,7 +42,19 @@ if os.path.exists(frontend_dist):
 
     @app.get("/")
     def serve_frontend():
-        return FileResponse(os.path.join(frontend_dist, "index.html"))
+        response = FileResponse(os.path.join(frontend_dist, "index.html"))
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+
+    @app.get("/index.html")
+    def serve_frontend_index():
+        response = FileResponse(os.path.join(frontend_dist, "index.html"))
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
 else:
     @app.get("/")
     def read_root():
@@ -64,11 +84,11 @@ def analyze_code(req: AnalyzeRequest):
     symbol_table = sym_builder.build()
 
     # 5. Semantic Analysis
-    sem_analyzer = SemanticAnalyzer(tokens, symbol_table)
+    sem_analyzer = SemanticAnalyzer(tokens, symbol_table, ast)
     semantic_issues = sem_analyzer.analyze()
 
     # 6. Memory Leak Analysis
-    mem_analyzer = MemoryAnalyzer(tokens)
+    mem_analyzer = MemoryAnalyzer(tokens, ast=ast, symbol_table=symbol_table)
     memory_analysis = mem_analyzer.analyze()
 
     # 7. Code Duplication Detection
@@ -83,7 +103,7 @@ def analyze_code(req: AnalyzeRequest):
     lines_count = len(code.splitlines())
     syntax_errs_count = len(syntax_issues)
     sem_errs_count = len(semantic_issues)
-    mem_issues_count = len([m for m in memory_analysis if m.status != "SAFE"])
+    mem_issues_count = len([m for m in memory_analysis if m.status not in ("SAFE", "ESCAPED")])
     dup_blocks_count = len(duplications)
     warn_count = len([a for a in anomalies if a.severity == "warning"])
 

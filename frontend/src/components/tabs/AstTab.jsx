@@ -11,10 +11,14 @@ function AstNodeView({ node, onSelectLine }) {
   const hasChildren = (node.statements && node.statements.length > 0) ||
                       (node.body && typeof node.body === 'object') ||
                       (node.initializer && typeof node.initializer === 'object') ||
+                      (node.init && typeof node.init === 'object') ||
+                      (node.increment && typeof node.increment === 'object') ||
                       (node.left && typeof node.left === 'object') ||
                       (node.right && typeof node.right === 'object') ||
                       (node.condition && typeof node.condition === 'object') ||
                       (node.then_branch && typeof node.then_branch === 'object') ||
+                      (node.else_branch && typeof node.else_branch === 'object') ||
+                      (node.operand && typeof node.operand === 'object') ||
                       (node.value && typeof node.value === 'object');
 
   const handleNodeClick = (e) => {
@@ -54,6 +58,27 @@ function AstNodeView({ node, onSelectLine }) {
             <AstNodeView key={idx} node={stmt} onSelectLine={onSelectLine} />
           ))}
 
+          {node.init && (
+            <div style={{ marginLeft: '12px', marginTop: '2px' }}>
+              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Init:</span>
+              <AstNodeView node={node.init} onSelectLine={onSelectLine} />
+            </div>
+          )}
+
+          {node.condition && (
+            <div style={{ marginLeft: '12px' }}>
+              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Condition:</span>
+              <AstNodeView node={node.condition} onSelectLine={onSelectLine} />
+            </div>
+          )}
+
+          {node.increment && (
+            <div style={{ marginLeft: '12px' }}>
+              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Increment:</span>
+              <AstNodeView node={node.increment} onSelectLine={onSelectLine} />
+            </div>
+          )}
+
           {node.body && (
             <AstNodeView node={node.body} onSelectLine={onSelectLine} />
           )}
@@ -79,17 +104,24 @@ function AstNodeView({ node, onSelectLine }) {
             </div>
           )}
 
-          {node.condition && (
-            <div style={{ marginLeft: '12px' }}>
-              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Condition:</span>
-              <AstNodeView node={node.condition} onSelectLine={onSelectLine} />
-            </div>
-          )}
-
           {node.then_branch && (
             <div style={{ marginLeft: '12px' }}>
               <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Then:</span>
               <AstNodeView node={node.then_branch} onSelectLine={onSelectLine} />
+            </div>
+          )}
+
+          {node.else_branch && (
+            <div style={{ marginLeft: '12px' }}>
+              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Else:</span>
+              <AstNodeView node={node.else_branch} onSelectLine={onSelectLine} />
+            </div>
+          )}
+
+          {node.operand && (
+            <div style={{ marginLeft: '12px' }}>
+              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Operand:</span>
+              <AstNodeView node={node.operand} onSelectLine={onSelectLine} />
             </div>
           )}
         </div>

@@ -5,6 +5,7 @@ import {
   Cpu, Copy, ShieldAlert, Lightbulb, FileText, BookOpen, Wand2
 } from 'lucide-react';
 import CodeEditor from './CodeEditor';
+import FixPreviewModal from './FixPreviewModal';
 import TokensTab from './tabs/TokensTab';
 import SyntaxTab from './tabs/SyntaxTab';
 import AstTab from './tabs/AstTab';
@@ -26,6 +27,9 @@ export default function CompilerInterface({ initialCode, onBackToWelcome, theme,
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [progressStage, setProgressStage] = useState('');
   const [analysisResult, setAnalysisResult] = useState(null);
+  const [previewSuggestion, setPreviewSuggestion] = useState(null);
+  const [codeSnapshot, setCodeSnapshot] = useState('');
+  const [analyzedCode, setAnalyzedCode] = useState('');
 
   const stages = [
     "Preprocessing...",
@@ -40,8 +44,9 @@ export default function CompilerInterface({ initialCode, onBackToWelcome, theme,
     "Generating report..."
   ];
 
-  const handleAnalyze = async () => {
-    if (!code.trim()) {
+  const handleAnalyze = async (codeToAnalyze = null) => {
+    const source = typeof codeToAnalyze === 'string' ? codeToAnalyze : code;
+    if (!source.trim()) {
       alert('Please enter or upload C source code before analyzing.');
       return;
     }
@@ -51,7 +56,7 @@ export default function CompilerInterface({ initialCode, onBackToWelcome, theme,
     // Progress stage simulation for user feedback
     for (let i = 0; i < stages.length; i++) {
       setProgressStage(stages[i]);
-      await new Promise(resolve => setTimeout(resolve, 80));
+      await new Promise(resolve => setTimeout(resolve, 60));
     }
 
     try {
@@ -62,7 +67,7 @@ export default function CompilerInterface({ initialCode, onBackToWelcome, theme,
       const response = await fetch(apiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code })
+        body: JSON.stringify({ code: source })
       });
 
       if (!response.ok) {
@@ -70,7 +75,15 @@ export default function CompilerInterface({ initialCode, onBackToWelcome, theme,
       }
 
       const data = await response.json();
+      // Attach the exact source snapshot used to generate these suggestions:
+      if (data && data.suggestions) {
+        data.suggestions = data.suggestions.map(s => ({
+          ...s,
+          sourceSnapshot: source
+        }));
+      }
       setAnalysisResult(data);
+      setAnalyzedCode(source);
     } catch (err) {
       alert(`Unable to connect to analysis server: ${err.message}. Please ensure the backend is running.`);
     } finally {
@@ -81,7 +94,15 @@ export default function CompilerInterface({ initialCode, onBackToWelcome, theme,
   const handleClear = () => {
     setCode('');
     setAnalysisResult(null);
+    setAnalyzedCode('');
     setActiveLine(null);
+    setPreviewSuggestion(null);
+  };
+
+  const handleSelectLine = (line) => {
+    if (line) {
+      setActiveLine({ line, ts: Date.now() });
+    }
   };
 
   const handleLoadSample = (e) => {
@@ -91,7 +112,9 @@ export default function CompilerInterface({ initialCode, onBackToWelcome, theme,
     if (sample) {
       setCode(sample.code);
       setAnalysisResult(null);
+      setAnalyzedCode('');
       setActiveLine(null);
+      setPreviewSuggestion(null);
     }
   };
 
@@ -108,7 +131,9 @@ export default function CompilerInterface({ initialCode, onBackToWelcome, theme,
     reader.onload = (evt) => {
       setCode(evt.target?.result || '');
       setAnalysisResult(null);
+      setAnalyzedCode('');
       setActiveLine(null);
+      setPreviewSuggestion(null);
     };
     reader.readAsText(file);
   };
@@ -131,20 +156,67 @@ export default function CompilerInterface({ initialCode, onBackToWelcome, theme,
     setCode(formatted);
   };
 
-  const handleApplyFix = (sugg) => {
-    if (!sugg.safe_fix) return;
-    const lines = code.split('\n');
-    if (0 <= sugg.line - 1 && sugg.line - 1 < lines.length) {
-      if (sugg.category === 'SYNTAX' && sugg.message.includes('semicolon')) {
-        lines[sugg.line - 1] = sugg.safe_fix;
-      } else if (sugg.category === 'MEMORY' && sugg.message.includes('not freed')) {
-        lines.splice(sugg.line, 0, `    ${sugg.safe_fix}`);
-      } else if (sugg.category === 'SEMANTIC' && sugg.message.includes('Undeclared')) {
-        lines.splice(sugg.line - 1, 0, `    ${sugg.safe_fix}`);
-      }
-      setCode(lines.join('\n'));
-      alert(`Safe fix applied to line ${sugg.line}. Click 'Analyze' to refresh compiler state.`);
+  const handleOpenPreview = (sugg) => {
+    // Retain the immutable source snapshot used when this suggestion was generated
+    const immutableSnapshot = sugg.sourceSnapshot || analyzedCode || code;
+    setPreviewSuggestion({ ...sugg, sourceSnapshot: immutableSnapshot });
+    setCodeSnapshot(immutableSnapshot);
+  };
+
+  const handleClosePreview = () => {
+    setPreviewSuggestion(null);
+  };
+
+  const handleConfirmFix = (sugg) => {
+    if (!sugg || (!sugg.safe_fix && !sugg.fixed_snippet)) return;
+    const normalize = (s) => (s || '').replace(/\r\n/g, '\n');
+    const snapshot = sugg.sourceSnapshot || codeSnapshot || analyzedCode;
+    
+    // Guard 1: Verify current source matches the exact snapshot used when preview was generated
+    if (normalize(code) !== normalize(snapshot)) {
+      alert('Cannot apply fix: source code has changed since preview was generated. Please close and re-analyze.');
+      return;
     }
+
+    const lines = normalize(code).split('\n');
+    const targetLine = sugg.target_line || sugg.line;
+    const idx = targetLine - 1;
+
+    // Guard 2: Line-level content check to ensure target line has not drifted
+    if (sugg.fix_type === 'replace' && sugg.original_snippet !== undefined && sugg.original_snippet !== null) {
+      if (lines[idx] !== sugg.original_snippet && lines[idx]?.trim() !== sugg.original_snippet?.trim()) {
+        alert('Cannot apply fix: target line content has changed since preview was generated. Please close and re-analyze.');
+        return;
+      }
+    }
+
+    let newCode = code;
+
+    if (sugg.fix_type === 'replace') {
+      if (0 <= idx && idx < lines.length) {
+        lines[idx] = sugg.fixed_snippet || sugg.safe_fix;
+        newCode = lines.join('\n');
+      }
+    } else if (sugg.fix_type === 'insert') {
+      if (0 <= idx && idx <= lines.length) {
+        lines.splice(idx, 0, sugg.fixed_snippet || sugg.safe_fix);
+        newCode = lines.join('\n');
+      }
+    } else {
+      // Fallback
+      if (sugg.category === 'SYNTAX' && sugg.message.includes('semicolon')) {
+        lines[idx] = sugg.safe_fix;
+      } else {
+        lines.splice(targetLine, 0, `    ${sugg.safe_fix}`);
+      }
+      newCode = lines.join('\n');
+    }
+
+    setCode(newCode);
+    setPreviewSuggestion(null);
+
+    // Automatically re-analyze with updated code
+    handleAnalyze(newCode);
   };
 
   return (
@@ -162,7 +234,7 @@ export default function CompilerInterface({ initialCode, onBackToWelcome, theme,
         </div>
 
         <div className="header-actions">
-          <button className="btn-action btn-primary" onClick={handleAnalyze}>
+          <button className="btn-action btn-primary" onClick={() => handleAnalyze()}>
             <Play size={14} />
             Analyze
           </button>
@@ -211,6 +283,7 @@ export default function CompilerInterface({ initialCode, onBackToWelcome, theme,
               onChange={setCode} 
               activeLine={activeLine} 
               theme={theme}
+              analysisResult={analysisResult}
             />
 
             {/* Analysis Progress Overlay */}
@@ -287,34 +360,40 @@ export default function CompilerInterface({ initialCode, onBackToWelcome, theme,
               <OverviewTab statistics={analysisResult?.statistics} onSwitchTab={setActiveTab} />
             )}
             {activeTab === 'tokens' && (
-              <TokensTab tokens={analysisResult?.tokens} tokenStats={analysisResult?.token_stats} onSelectLine={setActiveLine} />
+              <TokensTab tokens={analysisResult?.tokens} tokenStats={analysisResult?.token_stats} onSelectLine={handleSelectLine} />
             )}
             {activeTab === 'syntax' && (
-              <SyntaxTab syntaxIssues={analysisResult?.syntax_issues} onSelectLine={setActiveLine} />
+              <SyntaxTab syntaxIssues={analysisResult?.syntax_issues} onSelectLine={handleSelectLine} />
             )}
             {activeTab === 'ast' && (
-              <AstTab ast={analysisResult?.ast} onSelectLine={setActiveLine} />
+              <AstTab ast={analysisResult?.ast} onSelectLine={handleSelectLine} />
             )}
             {activeTab === 'symbols' && (
-              <SymbolTableTab symbolTable={analysisResult?.symbol_table} onSelectLine={setActiveLine} />
+              <SymbolTableTab symbolTable={analysisResult?.symbol_table} onSelectLine={handleSelectLine} />
             )}
             {activeTab === 'semantic' && (
-              <SemanticTab semanticIssues={analysisResult?.semantic_issues} onSelectLine={setActiveLine} />
+              <SemanticTab semanticIssues={analysisResult?.semantic_issues} onSelectLine={handleSelectLine} />
             )}
             {activeTab === 'memory' && (
-              <MemoryTab memoryAnalysis={analysisResult?.memory_analysis} onSelectLine={setActiveLine} />
+              <MemoryTab memoryAnalysis={analysisResult?.memory_analysis} onSelectLine={handleSelectLine} />
             )}
             {activeTab === 'duplication' && (
-              <DuplicationTab duplication={analysisResult?.duplication} onSelectLine={setActiveLine} />
+              <DuplicationTab duplication={analysisResult?.duplication} onSelectLine={handleSelectLine} />
             )}
             {activeTab === 'anomalies' && (
-              <AnomaliesTab anomalies={analysisResult?.anomalies} onSelectLine={setActiveLine} />
+              <AnomaliesTab anomalies={analysisResult?.anomalies} onSelectLine={handleSelectLine} />
             )}
             {activeTab === 'suggestions' && (
-              <SuggestionsTab suggestions={analysisResult?.suggestions} onSelectLine={setActiveLine} onApplyFix={handleApplyFix} />
+              <SuggestionsTab 
+                suggestions={analysisResult?.suggestions} 
+                currentCode={code}
+                analyzedCode={analyzedCode}
+                onSelectLine={handleSelectLine} 
+                onPreviewFix={handleOpenPreview} 
+              />
             )}
             {activeTab === 'report' && (
-              <ReportTab analysisResult={analysisResult} onAnalyze={handleAnalyze} onClear={handleClear} />
+              <ReportTab analysisResult={analysisResult} onAnalyze={() => handleAnalyze()} onClear={handleClear} />
             )}
             {activeTab === 'docs' && (
               <DocumentationTab />
@@ -322,6 +401,16 @@ export default function CompilerInterface({ initialCode, onBackToWelcome, theme,
           </div>
         </div>
       </div>
+
+      {/* FIX PREVIEW MODAL */}
+      <FixPreviewModal
+        isOpen={Boolean(previewSuggestion)}
+        suggestion={previewSuggestion}
+        currentCode={code}
+        codeSnapshot={codeSnapshot}
+        onClose={handleClosePreview}
+        onConfirm={handleConfirmFix}
+      />
     </div>
   );
 }

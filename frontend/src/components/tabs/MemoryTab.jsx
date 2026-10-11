@@ -48,9 +48,12 @@ export default function MemoryTab({ memoryAnalysis, onSelectLine }) {
                   <td>{mem.free_line ? `Line ${mem.free_line}` : '-'}</td>
                   <td>
                     {mem.status === 'SAFE' && <span className="badge badge-safe">SAFE</span>}
+                    {mem.status === 'ESCAPED' && <span className="badge badge-safe">ESCAPED</span>}
                     {mem.status === 'POSSIBLE LEAK' && <span className="badge badge-warning">POSSIBLE LEAK</span>}
+                    {mem.status === 'DEFINITE LEAK' && <span className="badge badge-error">DEFINITE LEAK</span>}
                     {mem.status === 'DOUBLE FREE' && <span className="badge badge-error">DOUBLE FREE</span>}
                     {mem.status === 'INVALID FREE' && <span className="badge badge-error">INVALID FREE</span>}
+                    {mem.status === 'USE AFTER FREE' && <span className="badge badge-error">USE AFTER FREE</span>}
                   </td>
                 </tr>
               ))

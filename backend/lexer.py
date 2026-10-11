@@ -4,13 +4,14 @@ from models import Token, TokenStats
 
 KEYWORDS = {
     "int", "float", "double", "char", "void",
-    "if", "else", "while", "for", "return",
-    "malloc", "calloc", "realloc", "free",
-    "struct", "typedef", "sizeof", "include", "printf", "scanf", "NULL", "break", "continue"
+    "if", "else", "while", "for", "do", "return",
+    "break", "continue", "struct", "typedef", "sizeof",
+    "switch", "case", "default", "const", "static", "unsigned", "signed", "long", "short"
 }
 
 OPERATORS = {
     "==", "!=", "<=", ">=", "&&", "||", "->", "++", "--",
+    "+=", "-=", "*=", "/=", "%=",
     "+", "-", "*", "/", "%", "=", "<", ">", "!", "&", "|", "."
 }
 

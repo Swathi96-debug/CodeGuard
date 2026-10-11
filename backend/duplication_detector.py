@@ -32,41 +32,60 @@ class DuplicationDetector:
         line_numbers = sorted(line_tokens.keys())
 
         for ln in line_numbers:
-            seq = " ".join(line_tokens[ln])
             # Only consider non-empty lines with meaningful tokens (>= 3 tokens)
             if len(line_tokens[ln]) >= 3:
+                seq = " ".join(line_tokens[ln])
                 lines_seq.append((ln, seq, line_raw.get(ln, "")))
 
-        # Compare pairs of lines or multi-line sequences (window of size 1 to 3)
         n = len(lines_seq)
-        seen_pairs = set()
+        matched_indices_a = set()
+        matched_indices_b = set()
 
-        for i in range(n):
-            for j in range(i + 1, n):
-                ln_a, seq_a, raw_a = lines_seq[i]
-                ln_b, seq_b, raw_b = lines_seq[j]
-
-                if abs(ln_a - ln_b) < 1:
-                    continue  # Ignore overlapping same lines
-
-                if seq_a == seq_b:
-                    pair_key = (min(ln_a, ln_b), max(ln_a, ln_b))
-                    if pair_key in seen_pairs:
+        # Multi-line block detection (window size >= 2 down to 2)
+        # Prevents false-positive single-line matches (e.g. adjacent variable declarations)
+        max_window = min(10, n // 2)
+        for window in range(max_window, 1, -1):
+            for i in range(n - window + 1):
+                if any(idx in matched_indices_a for idx in range(i, i + window)):
+                    continue
+                token_count = sum(len(line_tokens[lines_seq[i + k][0]]) for k in range(window))
+                if window < 3 and token_count < 12:
+                    continue
+                block_a_seq = [lines_seq[i + k][1] for k in range(window)]
+                for j in range(i + window, n - window + 1):
+                    if any(idx in matched_indices_b for idx in range(j, j + window)):
                         continue
-                    seen_pairs.add(pair_key)
-
-                    is_exact = (raw_a.strip() == raw_b.strip())
-                    similarity = 100.0 if is_exact else 92.5
-                    reason = "Exact line structure match." if is_exact else "Normalized token structure match (renamed identifiers/variables)."
-
-                    duplicates.append(DuplicateBlock(
-                        block_a_lines=[ln_a, ln_a],
-                        block_b_lines=[ln_b, ln_b],
-                        similarity_percentage=similarity,
-                        reason=reason,
-                        suggestion="Consider extracting repeated logic into a reusable helper function.",
-                        code_snippet_a=raw_a.strip(),
-                        code_snippet_b=raw_b.strip()
-                    ))
+                    block_b_seq = [lines_seq[j + k][1] for k in range(window)]
+                    if block_a_seq == block_b_seq:
+                        for k in range(window):
+                            matched_indices_a.add(i + k)
+                            matched_indices_b.add(j + k)
+                        
+                        ln_a_start = lines_seq[i][0]
+                        ln_a_end = lines_seq[i + window - 1][0]
+                        ln_b_start = lines_seq[j][0]
+                        ln_b_end = lines_seq[j + window - 1][0]
+                        
+                        snippet_a = "\n".join(lines_seq[i + k][2].strip() for k in range(window))
+                        snippet_b = "\n".join(lines_seq[j + k][2].strip() for k in range(window))
+                        
+                        is_exact = (snippet_a == snippet_b)
+                        similarity = 100.0 if is_exact else 92.5
+                        reason = (
+                            f"Exact multi-line block match ({window} lines)."
+                            if is_exact else
+                            f"Normalized token block match ({window} lines with renamed variables)."
+                        )
+                        
+                        duplicates.append(DuplicateBlock(
+                            block_a_lines=[ln_a_start, ln_a_end],
+                            block_b_lines=[ln_b_start, ln_b_end],
+                            similarity_percentage=similarity,
+                            reason=reason,
+                            suggestion="Consider extracting repeated logic into a reusable helper function.",
+                            code_snippet_a=snippet_a,
+                            code_snippet_b=snippet_b
+                        ))
+                        break
 
         return duplicates

@@ -8,12 +8,13 @@ def create_program_node(statements: List[Dict[str, Any]]) -> Dict[str, Any]:
         "line": 1
     }
 
-def create_function_decl_node(return_type: str, name: str, body: Dict[str, Any], line: int) -> Dict[str, Any]:
+def create_function_decl_node(return_type: str, name: str, body: Dict[str, Any], line: int, params: Optional[List[str]] = None) -> Dict[str, Any]:
     return {
         "type": "FunctionDeclarationNode",
         "label": f"Function {name} ({return_type})",
         "name": name,
         "return_type": return_type,
+        "params": params or [],
         "body": body,
         "line": line
     }
@@ -109,3 +110,50 @@ def create_block_node(statements: List[Dict[str, Any]], line: int) -> Dict[str, 
         "statements": statements,
         "line": line
     }
+
+def create_for_node(init: Optional[Dict[str, Any]], condition: Optional[Dict[str, Any]], increment: Optional[Dict[str, Any]], body: Dict[str, Any], line: int) -> Dict[str, Any]:
+    return {
+        "type": "ForNode",
+        "label": "For Loop",
+        "init": init,
+        "condition": condition,
+        "increment": increment,
+        "body": body,
+        "line": line
+    }
+
+def create_do_while_node(body: Dict[str, Any], condition: Dict[str, Any], line: int) -> Dict[str, Any]:
+    return {
+        "type": "DoWhileNode",
+        "label": "Do-While Loop",
+        "body": body,
+        "condition": condition,
+        "line": line
+    }
+
+def create_break_node(line: int) -> Dict[str, Any]:
+    return {
+        "type": "BreakNode",
+        "label": "Break Statement",
+        "line": line
+    }
+
+def create_continue_node(line: int) -> Dict[str, Any]:
+    return {
+        "type": "ContinueNode",
+        "label": "Continue Statement",
+        "line": line
+    }
+
+def create_unary_expr_node(operator: str, operand: Dict[str, Any], is_prefix: bool, line: int) -> Dict[str, Any]:
+    op_label = operand.get("label", operand.get("name", str(operand))) if isinstance(operand, dict) else str(operand)
+    lbl = f"{operator}{op_label}" if is_prefix else f"{op_label}{operator}"
+    return {
+        "type": "UnaryExpressionNode",
+        "label": f"UnaryOp ({lbl})",
+        "operator": operator,
+        "operand": operand,
+        "is_prefix": is_prefix,
+        "line": line
+    }
+
