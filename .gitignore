@@ -20,6 +20,7 @@ env/
 .idea/
 *.swp
 *.swo
+.vercel/
 
 # Environment variables
 .env
