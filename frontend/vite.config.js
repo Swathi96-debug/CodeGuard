@@ -6,6 +6,22 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
-    host: true
+    host: true,
+    proxy: {
+      '/analyze': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true
+      }
+    }
+  },
+  preview: {
+    port: 4173,
+    host: true,
+    proxy: {
+      '/analyze': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true
+      }
+    }
   }
 })

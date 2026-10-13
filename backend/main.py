@@ -1,8 +1,9 @@
+import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-from models import AnalyzeRequest, AnalyzeResponse, PreprocessResult, ReportStats
+from models import AnalyzeRequest, AnalyzeResponse, PreprocessResult, ReportStats, MAX_CODE_LENGTH
 from preprocessor import Preprocessor
 from lexer import Lexer
 from parser import Parser
@@ -14,11 +15,31 @@ from suggestion_engine import SuggestionEngine
 
 app = FastAPI(title="CodeGuard C Compiler Analysis API", version="1.0.0")
 
+# Sensible default origins for local development (Vite dev server, preview, and alternative local ports)
+DEFAULT_DEV_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",
+    "http://127.0.0.1:4173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+# Read optional comma-separated allowed origins from ALLOWED_ORIGINS environment variable
+env_origins_str = os.getenv("ALLOWED_ORIGINS", "").strip()
+if env_origins_str:
+    allowed_origins = [orig.strip() for orig in env_origins_str.split(",") if orig.strip()]
+    for dev_orig in DEFAULT_DEV_ORIGINS:
+        if dev_orig not in allowed_origins:
+            allowed_origins.append(dev_orig)
+else:
+    allowed_origins = list(DEFAULT_DEV_ORIGINS)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=allowed_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -67,6 +88,11 @@ def analyze_code(req: AnalyzeRequest):
     code = req.code
     if not code or not code.strip():
         raise HTTPException(status_code=400, detail="No C code provided.")
+    if len(code) > MAX_CODE_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Source code exceeds maximum allowed size of {MAX_CODE_LENGTH} characters."
+        )
 
     # 1. Preprocessing (Comment removal)
     processed_code = Preprocessor.process(code)

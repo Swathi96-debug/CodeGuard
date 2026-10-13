@@ -60,9 +60,12 @@ export default function CompilerInterface({ initialCode, onBackToWelcome, theme,
     }
 
     try {
-      const apiUrl = window.location.origin.includes('5173')
-        ? 'http://127.0.0.1:8000/analyze'
-        : '/analyze';
+      let apiUrl = '/analyze';
+      const envApiUrl = import.meta.env.VITE_API_URL;
+      if (envApiUrl && typeof envApiUrl === 'string' && envApiUrl.trim()) {
+        const cleanBase = envApiUrl.trim().replace(/\/+$/, '');
+        apiUrl = cleanBase.endsWith('/analyze') ? cleanBase : `${cleanBase}/analyze`;
+      }
 
       const response = await fetch(apiUrl, {
         method: 'POST',

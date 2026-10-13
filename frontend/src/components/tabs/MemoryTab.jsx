@@ -1,6 +1,24 @@
 import React from 'react';
 import { Cpu, ShieldAlert, CheckCircle2 } from 'lucide-react';
 
+const renderStatusBadge = (status) => {
+  switch (status) {
+    case 'SAFE':
+    case 'ESCAPED':
+      return <span className="badge badge-safe">{status}</span>;
+    case 'POSSIBLE LEAK':
+    case 'POSSIBLE DOUBLE FREE':
+      return <span className="badge badge-warning">{status}</span>;
+    case 'DEFINITE LEAK':
+    case 'DOUBLE FREE':
+    case 'INVALID FREE':
+    case 'USE AFTER FREE':
+      return <span className="badge badge-error">{status}</span>;
+    default:
+      return <span className="badge badge-info">{status || 'UNKNOWN'}</span>;
+  }
+};
+
 export default function MemoryTab({ memoryAnalysis, onSelectLine }) {
   return (
     <div>
@@ -46,15 +64,7 @@ export default function MemoryTab({ memoryAnalysis, onSelectLine }) {
                   <td>Line {mem.allocation_line}</td>
                   <td>{mem.freed ? 'Yes' : 'No'}</td>
                   <td>{mem.free_line ? `Line ${mem.free_line}` : '-'}</td>
-                  <td>
-                    {mem.status === 'SAFE' && <span className="badge badge-safe">SAFE</span>}
-                    {mem.status === 'ESCAPED' && <span className="badge badge-safe">ESCAPED</span>}
-                    {mem.status === 'POSSIBLE LEAK' && <span className="badge badge-warning">POSSIBLE LEAK</span>}
-                    {mem.status === 'DEFINITE LEAK' && <span className="badge badge-error">DEFINITE LEAK</span>}
-                    {mem.status === 'DOUBLE FREE' && <span className="badge badge-error">DOUBLE FREE</span>}
-                    {mem.status === 'INVALID FREE' && <span className="badge badge-error">INVALID FREE</span>}
-                    {mem.status === 'USE AFTER FREE' && <span className="badge badge-error">USE AFTER FREE</span>}
-                  </td>
+                  <td>{renderStatusBadge(mem.status)}</td>
                 </tr>
               ))
             )}

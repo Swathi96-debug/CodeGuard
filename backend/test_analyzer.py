@@ -3875,6 +3875,58 @@ int y = 20;"""
                 self.assertIsNone(s.safe_fix)
 
 
+class TestAnalyzeRequestValidation(unittest.TestCase):
+    """Regression tests for API request validation, size guardrails, and client error handling."""
+
+    def test_valid_request(self):
+        from main import analyze_code
+        from models import AnalyzeRequest
+        code = "int main() { return 0; }"
+        res = analyze_code(AnalyzeRequest(code=code))
+        self.assertIsNotNone(res)
+        self.assertEqual(res.statistics.overall_status, "CLEAN")
+
+    def test_empty_request_raises_http_400(self):
+        from main import analyze_code
+        from models import AnalyzeRequest
+        from fastapi import HTTPException
+        req = AnalyzeRequest(code="")
+        with self.assertRaises(HTTPException) as ctx:
+            analyze_code(req)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("No C code provided", ctx.exception.detail)
+
+    def test_whitespace_only_request_raises_http_400(self):
+        from main import analyze_code
+        from models import AnalyzeRequest
+        from fastapi import HTTPException
+        req = AnalyzeRequest(code="   \n\t  ")
+        with self.assertRaises(HTTPException) as ctx:
+            analyze_code(req)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("No C code provided", ctx.exception.detail)
+
+    def test_oversized_input_rejected_by_pydantic_validation(self):
+        from models import AnalyzeRequest, MAX_CODE_LENGTH
+        from pydantic import ValidationError
+        oversized_code = "int a = 1;\n" * (MAX_CODE_LENGTH // 10 + 10)
+        self.assertGreater(len(oversized_code), MAX_CODE_LENGTH)
+        with self.assertRaises(ValidationError) as ctx:
+            AnalyzeRequest(code=oversized_code)
+        self.assertTrue(any("code" in str(err) for err in ctx.exception.errors()))
+
+    def test_oversized_input_rejected_by_endpoint_guard(self):
+        from main import analyze_code
+        from models import AnalyzeRequest, MAX_CODE_LENGTH
+        from fastapi import HTTPException
+        # Construct model bypassing pydantic field validation to verify endpoint guardrail
+        oversized_req = AnalyzeRequest.model_construct(code="a" * (MAX_CODE_LENGTH + 10))
+        with self.assertRaises(HTTPException) as ctx:
+            analyze_code(oversized_req)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("exceeds maximum allowed size", ctx.exception.detail)
+
+
 if __name__ == "__main__":
     unittest.main()
 

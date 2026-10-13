@@ -1,8 +1,15 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional, Any, Dict
 
+# Maximum source code length allowed for analysis (~100 KB, approx. 2,500-3,500 LOC)
+MAX_CODE_LENGTH = 100_000
+
 class AnalyzeRequest(BaseModel):
-    code: str
+    code: str = Field(
+        ...,
+        max_length=MAX_CODE_LENGTH,
+        description=f"C source code to analyze. Maximum length is {MAX_CODE_LENGTH} characters."
+    )
 
 class Token(BaseModel):
     id: int
